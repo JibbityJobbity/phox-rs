@@ -24,11 +24,12 @@ pub struct ForwardTechnique {
     tonemap: TonemapPass,
     readback: ReadbackPass,
     frame: Option<FrameInputs>,
+    options: ForwardOptions,
 }
 
 impl ForwardTechnique {
-    pub fn new(device: Arc<dyn Device>) -> Self {
-        Self { device, forward: ForwardPass::default(), tonemap: TonemapPass::default(), readback: ReadbackPass, frame: None }
+    pub fn new(device: Arc<dyn Device>, options: ForwardOptions) -> Self {
+        Self { device, forward: ForwardPass::default(), tonemap: TonemapPass::default(), readback: ReadbackPass, frame: None, options }
     }
 
     /// The inputs of the next `build`.
@@ -51,7 +52,7 @@ impl Technique for ForwardTechnique {
     }
 
     fn init(&mut self, device: &dyn Device) -> GraphResult<()> {
-        self.forward.init(device)?;
+        self.forward.init(device, self.options)?;
         self.tonemap.init(device).map_err(GraphError::from)?;
         Ok(())
     }

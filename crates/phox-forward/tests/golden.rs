@@ -6,6 +6,7 @@
 //!                         comma-separated list of case names updates only those
 //!   PHOX_VALIDATION=1     run with the validation layer (incl. synchronization) and fail on any message
 //!   PHOX_REQUIRE_GPU=1    fail instead of skipping when no Vulkan device is available
+//!   PHOX_REQUIRE_MESH_SHADERS=1  fail instead of skipping the mesh shader paths when the device lacks them
 //!   PHOX_DEVICE=<name>    render on the device whose name contains <name>, e.g. "llvmpipe"
 
 use phox_core::cpu_image::{CpuImage, compare_images, read_ppm, write_ppm};
@@ -94,18 +95,50 @@ fn render(renderer: &mut ForwardRenderer, case: &Case) -> CpuImage {
     renderer.last_frame().clone()
 }
 
-#[test]
-#[serial]
-fn vertex_path_matches_the_goldens() {
-    let Some(vulkan) = device() else { return };
-    println!("Vulkan device: {}", vulkan.info().name);
-    let mut renderer = ForwardRenderer::new(Arc::new(vulkan.clone()), RendererConfig { extent: Extent2D::new(320, 240), ..RendererConfig::default() }).unwrap();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Path {
+    Vertex,
+    MeshOcclusion,
+    Mesh,
+}
+
+impl Path {
+    fn name(self) -> &'static str {
+        match self {
+            Path::Vertex => "vertex shaders",
+            Path::MeshOcclusion => "mesh shaders, occlusion culling",
+            Path::Mesh => "mesh shaders",
+        }
+    }
+
+    fn config(self) -> RendererConfig {
+        RendererConfig {
+            extent: Extent2D::new(320, 240),
+            mesh_shaders: self != Path::Vertex,
+            occlusion_culling: self == Path::MeshOcclusion,
+            ..RendererConfig::default()
+        }
+    }
+}
+
+/// Renders every case with one renderer configuration and compares with the goldens (which every path must
+/// match: culling never changes the picture). Only the vertex path rewrites them. Returns the failed cases,
+/// or `None` when the path was skipped.
+fn run_path(vulkan: &VulkanDevice, path: Path) -> Option<Vec<String>> {
+    if path != Path::Vertex && !vulkan.info().mesh_shaders {
+        assert!(!flag("PHOX_REQUIRE_MESH_SHADERS"), "{} has no mesh shaders", vulkan.info().name);
+        eprintln!("{} has no mesh shaders; skipping the mesh shader paths", vulkan.info().name);
+        return None;
+    }
+    let mut renderer = ForwardRenderer::new(Arc::new(vulkan.clone()), path.config()).unwrap();
+    assert_eq!(renderer.uses_mesh_shaders(), path != Path::Vertex);
+    assert_eq!(renderer.uses_occlusion_culling(), path == Path::MeshOcclusion);
 
     let mut failures = Vec::new();
     for case in cases() {
         let actual = render(&mut renderer, &case);
         let golden = golden_dir().join(format!("{}.ppm", case.name));
-        if update_requested(case.name) {
+        if path == Path::Vertex && update_requested(case.name) {
             write_ppm(&golden, &actual).unwrap();
             println!("updated {}", golden.display());
             continue;
@@ -115,21 +148,38 @@ fn vertex_path_matches_the_goldens() {
         let allowed = (case.allowed_fraction * expected.width as f64 * expected.height as f64) as usize;
         let pass = !diff.size_mismatch && diff.pixels_over_tolerance <= allowed;
         println!(
-            "{} {} (vertex shaders): max channel delta {}, {} pixel(s) over tolerance (allowed {allowed}){}",
+            "{} {} ({}): max channel delta {}, {} pixel(s) over tolerance (allowed {allowed}){}",
             if pass { "PASS" } else { "FAIL" },
             case.name,
+            path.name(),
             diff.max_channel_delta,
             diff.pixels_over_tolerance,
             if diff.size_mismatch { ", size mismatch" } else { "" }
         );
         if !pass {
-            let out = PathBuf::from("golden_out").join(format!("{}.vulkan.ppm", case.name));
+            let suffix = match path {
+                Path::Vertex => "vulkan",
+                Path::MeshOcclusion => "occlusion",
+                Path::Mesh => "mesh",
+            };
+            let out = PathBuf::from("golden_out").join(format!("{}.{suffix}.ppm", case.name));
             write_ppm(&out, &actual).unwrap();
             println!("  actual image written to {}", std::fs::canonicalize(&out).unwrap_or(out).display());
-            failures.push(case.name);
+            failures.push(format!("{} ({})", case.name, path.name()));
         }
     }
-    drop(renderer);
+    Some(failures)
+}
+
+#[test]
+#[serial]
+fn every_path_matches_the_goldens() {
+    let Some(vulkan) = device() else { return };
+    println!("Vulkan device: {}", vulkan.info().name);
+    let mut failures = Vec::new();
+    for path in [Path::Vertex, Path::MeshOcclusion, Path::Mesh] {
+        failures.extend(run_path(&vulkan, path).unwrap_or_default());
+    }
     let (errors, warnings) = vulkan.validation_counts();
     assert!(errors == 0 && warnings == 0, "validation reported {errors} error(s) and {warnings} warning(s)");
     assert!(failures.is_empty(), "differs from the goldens: {failures:?}");

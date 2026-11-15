@@ -12,7 +12,7 @@ use std::sync::Arc;
 #[test]
 fn needs_the_texture_table() {
     let device = Arc::new(NullDevice::new()); // no features
-    let technique = ForwardTechnique::new(device.clone());
+    let technique = ForwardTechnique::new(device.clone(), ForwardOptions::default());
     assert!(!technique.is_supported(&device.capabilities()));
     device.set_features([Feature::BindlessDescriptors]);
     assert!(technique.is_supported(&device.capabilities()));
@@ -35,7 +35,7 @@ fn records_forward_tonemap_readback() {
     device.set_features([Feature::BindlessDescriptors]);
     let mut renderer = ForwardRenderer::new(
         device.clone(),
-        RendererConfig { extent: Extent2D::new(64, 48), capture_graph: true, timestamps: false },
+        RendererConfig { extent: Extent2D::new(64, 48), capture_graph: true, timestamps: false, mesh_shaders: false, ..RendererConfig::default() },
     )
     .unwrap();
     let sample = make_sample_scene(SampleSceneId::Cubes).unwrap();
@@ -53,6 +53,36 @@ fn records_forward_tonemap_readback() {
         assert!(dot.contains(needle), "missing '{needle}' in:\n{dot}");
     }
     assert_eq!(renderer.last_frame().width, 64);
+}
+
+#[test]
+fn the_mesh_path_records_two_phases_around_a_depth_pyramid() {
+    let device = Arc::new(NullDevice::new());
+    device.set_features([Feature::BindlessDescriptors, Feature::MeshShader]);
+    let mut renderer = ForwardRenderer::new(device.clone(), RendererConfig { extent: Extent2D::new(64, 48), timestamps: false, ..RendererConfig::default() }).unwrap();
+    assert!(renderer.uses_mesh_shaders() && renderer.uses_occlusion_culling());
+    let sample = make_sample_scene(SampleSceneId::Cubes).unwrap();
+    renderer.render(&sample.scene).unwrap(); // the first frame: nothing was visible before, so no early work
+    renderer.render(&sample.scene).unwrap();
+
+    let recording = device.last_recording();
+    let labels: Vec<&str> = recording.iter().filter_map(|c| c.strip_prefix("beginDebugLabel:")).collect();
+    assert_eq!(labels, ["forward early", "depth pyramid", "forward late", "tonemap", "readback"]);
+    assert!(recording.contains(&"drawMeshTasksIndirect".to_string()));
+    assert!(recording.contains(&"dispatch".to_string())); // the pyramid's mips
+    assert!(!recording.contains(&"drawIndexedIndirect".to_string())); // nothing opaque on the vertex path
+}
+
+#[test]
+fn without_occlusion_culling_one_mesh_pass_draws() {
+    let device = Arc::new(NullDevice::new());
+    device.set_features([Feature::BindlessDescriptors, Feature::MeshShader]);
+    let config = RendererConfig { extent: Extent2D::new(64, 48), timestamps: false, occlusion_culling: false, ..RendererConfig::default() };
+    let mut renderer = ForwardRenderer::new(device.clone(), config).unwrap();
+    assert!(renderer.uses_mesh_shaders() && !renderer.uses_occlusion_culling());
+    renderer.render(&make_sample_scene(SampleSceneId::Cubes).unwrap().scene).unwrap();
+    let labels: Vec<String> = device.last_recording().into_iter().filter_map(|c| c.strip_prefix("beginDebugLabel:").map(str::to_string)).collect();
+    assert_eq!(labels, ["forward", "tonemap", "readback"]);
 }
 
 #[test]

@@ -11,11 +11,12 @@ mod renderer;
 pub mod shaders;
 mod technique;
 mod texture_cache;
+mod visibility;
 
 pub use error::{ForwardError, Result};
 pub use gpu_types::{DrawCommand, GpuDraw, VertexDrawPushConstants};
 pub use mesh_cache::{GpuMeshInfo, MeshCache};
-pub use passes::{DEPTH_FORMAT, ForwardPass, HDR_FORMAT, HEADLESS_FORMAT, ReadbackPass, TonemapPass};
+pub use passes::{DEPTH_FORMAT, ForwardOptions, ForwardPass, HDR_FORMAT, HEADLESS_FORMAT, ReadbackPass, TonemapPass};
 pub use renderer::{ForwardRenderer, PassTiming, RendererConfig};
 pub use texture_cache::TextureCache;
 pub use technique::{ForwardTechnique, FrameInputs};

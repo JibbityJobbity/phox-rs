@@ -1,8 +1,9 @@
 //! `phox-sample`: renders a Phox sample scene, headless or in a window.
 //!
-//! Headless rendering goes through the forward technique on Vulkan, and falls back to the software
-//! rasterizer when there is no usable device. Windowed mode, cluster LOD and the mesh shader options arrive
-//! with later phases: they are parsed (so the interface is final) and reported as ignored until then.
+//! Headless rendering goes through the forward technique on Vulkan (vertex shaders, or task and mesh shaders with
+//! meshlet and occlusion culling), and falls back to the software rasterizer when there is no usable device.
+//! Windowed mode and cluster LOD arrive with later phases: their options are parsed (so the interface is
+//! final) and reported as ignored until then.
 
 use phox_core::cpu_image::write_ppm;
 use phox_core::mesh_loader::load_mesh;
@@ -224,9 +225,29 @@ fn run(args: &Args) -> Result<i32, CliError> {
         return Ok(0);
     };
 
-    println!("Rendering on {} with vertex shaders", device.info().name);
-    let config = RendererConfig { extent, capture_graph: args.has("dump-graph"), timestamps: true };
+    let mode = args.value("mesh-shaders");
+    let config = RendererConfig {
+        extent,
+        capture_graph: args.has("dump-graph"),
+        timestamps: true,
+        mesh_shaders: mode != "off",
+        meshlet_culling: mode != "nocull",
+        occlusion_culling: mode == "on",
+    };
     let mut renderer = ForwardRenderer::new(Arc::new(device.clone()), config).map_err(|e| CliError::Failed(e.to_string()))?;
+    println!(
+        "Rendering on {} with {}",
+        device.info().name,
+        if !renderer.uses_mesh_shaders() {
+            "vertex shaders"
+        } else if renderer.uses_occlusion_culling() {
+            "mesh shaders, frustum, cone and occlusion culling"
+        } else if mode != "nocull" {
+            "mesh shaders, frustum and cone culling"
+        } else {
+            "mesh shaders, no meshlet culling"
+        }
+    );
     // The first frames upload meshes and create pooled images, so they are left out of the averages.
     const WARMUP_FRAMES: i64 = 3;
     let mut timings = TimingAverages::default();

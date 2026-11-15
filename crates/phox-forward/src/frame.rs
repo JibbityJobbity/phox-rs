@@ -71,6 +71,10 @@ pub struct FrameSlot {
     pub draws: GrowBuffer,
     /// The indirect draw commands.
     pub commands: GrowBuffer,
+    /// Meshlet path: the task shaders' work items, by list and bucket.
+    pub work: GrowBuffer,
+    /// Meshlet path: each list's `DrawCounters`, which are also its indirect dispatch arguments.
+    pub counters: GrowBuffer,
     pub ticket: Option<SubmitTicket>,
 }
 
@@ -81,6 +85,8 @@ impl FrameSlot {
             materials: GrowBuffer::new(device.clone(), "materials", BufferUsage::STORAGE, false)?,
             draws: GrowBuffer::new(device.clone(), "draws", BufferUsage::STORAGE, true)?,
             commands: GrowBuffer::new(device.clone(), "draw commands", BufferUsage::INDIRECT, false)?,
+            work: GrowBuffer::new(device.clone(), "meshlet work", BufferUsage::STORAGE, true)?,
+            counters: GrowBuffer::new(device.clone(), "meshlet counters", BufferUsage::INDIRECT | BufferUsage::STORAGE, true)?,
             ticket: None,
         })
     }

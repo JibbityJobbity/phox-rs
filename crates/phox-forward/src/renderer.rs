@@ -7,6 +7,7 @@ use crate::mesh_cache::MeshCache;
 use crate::passes::*;
 use crate::technique::{ForwardTechnique, FrameInputs};
 use crate::texture_cache::TextureCache;
+use crate::visibility::{Visibility, VisibilityStore};
 use phox_core::cpu_image::CpuImage;
 use phox_core::graph::*;
 use phox_core::render_view::{DrawItem, RenderView, extract_view};
@@ -27,11 +28,27 @@ pub struct RendererConfig {
     pub capture_graph: bool,
     /// Write GPU timestamps around each pass when the device can ([`ForwardRenderer::gpu_timings`]).
     pub timestamps: bool,
+    /// Draw with task and mesh shaders where the device has them, as meshlets the task shader culls.
+    /// Otherwise, or when off, meshes are drawn with vertex shaders.
+    pub mesh_shaders: bool,
+    /// With mesh shaders: cull meshlets outside the view frustum and, for single-sided materials, those
+    /// facing away from the camera. Off only to measure what culling gains.
+    pub meshlet_culling: bool,
+    /// With meshlet culling: also cull meshlets hidden behind others, drawing in two phases around a depth
+    /// pyramid.
+    pub occlusion_culling: bool,
 }
 
 impl Default for RendererConfig {
     fn default() -> Self {
-        Self { extent: Extent2D::new(640, 480), capture_graph: false, timestamps: true }
+        Self {
+            extent: Extent2D::new(640, 480),
+            capture_graph: false,
+            timestamps: true,
+            mesh_shaders: true,
+            meshlet_culling: true,
+            occlusion_culling: true,
+        }
     }
 }
 
@@ -50,6 +67,10 @@ pub struct ForwardRenderer {
     frames: Vec<FrameSlot>,
     meshes: MeshCache,
     textures: TextureCache,
+    visibility: VisibilityStore,
+    meshlets: bool,
+    occlusion: bool,
+    meshlet_culling: bool,
     readback: Option<(BufferHandle, Extent2D)>,
     frame_count: u64,
     last_frame: CpuImage,
@@ -63,12 +84,19 @@ fn byte_len<T>(items: &[T]) -> u64 {
 
 impl ForwardRenderer {
     pub fn new(device: Arc<dyn Device>, config: RendererConfig) -> Result<Self> {
-        let mut technique = ForwardTechnique::new(device.clone());
+        let meshlets = config.mesh_shaders && device.capabilities().has(Feature::MeshShader);
+        // Occlusion culling needs meshlet culling (and the D32 depth buffer every device has).
+        let occlusion = meshlets && config.meshlet_culling && config.occlusion_culling;
+        let mut technique = ForwardTechnique::new(device.clone(), ForwardOptions { meshlets, occlusion });
         technique.init(device.as_ref())?;
         let frames = (0..FRAMES_IN_FLIGHT).map(|_| FrameSlot::new(&device)).collect::<Result<Vec<_>>>()?;
         Ok(Self {
             graph: RenderGraph::new(device.clone()),
-            meshes: MeshCache::new(device.clone())?,
+            meshes: MeshCache::new(device.clone(), meshlets)?,
+            visibility: VisibilityStore::new(device.clone()),
+            meshlets,
+            occlusion,
+            meshlet_culling: config.meshlet_culling,
             textures: TextureCache::new(device.clone()),
             technique,
             frames,
@@ -84,6 +112,16 @@ impl ForwardRenderer {
 
     pub fn device(&self) -> &Arc<dyn Device> {
         &self.device
+    }
+
+    /// Opaque meshes are drawn as meshlets by task and mesh shaders.
+    pub fn uses_mesh_shaders(&self) -> bool {
+        self.meshlets
+    }
+
+    /// Meshlets hidden behind others are culled too, in two phases around a depth pyramid.
+    pub fn uses_occlusion_culling(&self) -> bool {
+        self.occlusion
     }
 
     /// The most recent headless frame.
@@ -199,11 +237,22 @@ impl ForwardRenderer {
             resolution: phox_core::math::Vec4::new(w, h, 1.0 / w, 1.0 / h),
             frustum_planes: view.frustum_planes,
         };
+        // Occlusion culling keeps each opaque object's visible meshlets from frame to frame.
+        let opaque_count = view.draws.len();
+        let visibility: Vec<Visibility> = if self.occlusion {
+            let objects: Vec<(u64, u64, u32)> = items[..opaque_count]
+                .iter()
+                .map(|item| (item.object_id, item.mesh.id(), self.meshes.get(item.mesh).map_or(0, |i| i.meshlet_count)))
+                .collect();
+            self.visibility.assign(&objects)?
+        } else {
+            Vec::new()
+        };
         let mut draws: Vec<GpuDraw> = Vec::with_capacity(items.len());
         for (d, item) in items.iter().enumerate() {
             let info = self.meshes.get(item.mesh).ok_or_else(|| ForwardError::Other("a mesh was not uploaded".into()))?;
             let camera = (item.model.inverse() * view.camera_position.extend(1.0)).truncate();
-            draws.push(GpuDraw {
+            let mut draw = GpuDraw {
                 model: item.model,
                 camera_position: camera.extend(1.0),
                 vertices: split_address(info.vertex_address),
@@ -212,7 +261,17 @@ impl ForwardRenderer {
                 material: d as u32,
                 visibility_offset: 0,
                 flags: 0,
-            });
+            };
+            if self.meshlets && d < opaque_count {
+                draw.primitives = split_address(info.meshlet_address);
+                draw.count = info.meshlet_count;
+                draw.flags = if item.cull_back_faces { DRAW_CONE_CULLING } else { 0 };
+                if let Some(v) = visibility.get(d) {
+                    draw.visibility_offset = v.offset;
+                    draw.flags |= if v.valid { DRAW_EARLY } else { 0 };
+                }
+            }
+            draws.push(draw);
         }
         let command = |d: usize, item: &DrawItem<'_>| {
             let info = self.meshes.get(item.mesh).expect("uploaded above");
@@ -238,7 +297,43 @@ impl ForwardRenderer {
             }
         }
 
+        // Meshlet path: a work item is (draw, group of 32 meshlets); one list per phase and cull bucket.
+        let mut lists: [[Vec<[u32; 2]>; 2]; 3] = Default::default();
+        if self.meshlets {
+            let phases: &[Phase] = if self.occlusion { &[Phase::Early, Phase::Late] } else { &[Phase::Plain] };
+            for (d, draw) in draws.iter().enumerate().take(opaque_count) {
+                let bucket = usize::from(view.draws[d].cull_back_faces);
+                for &phase in phases {
+                    if phase == Phase::Early && draw.flags & DRAW_EARLY == 0 {
+                        continue; // nothing of it was visible last frame
+                    }
+                    lists[phase as usize][bucket].extend((0..draw.count.div_ceil(32)).map(|group| [d as u32, group]));
+                }
+            }
+        }
+        let work_capacity = lists.iter().flatten().map(Vec::len).max().unwrap_or(0).max(1) as u32;
+        let mut work = vec![[0u32; 2]; 3 * 2 * work_capacity as usize];
+        let mut counters = [DrawCounters::default(); 3];
+        let max_x = self.device.capabilities().max_task_workgroup_count_x.max(1);
+        for (phase, buckets) in lists.iter().enumerate() {
+            for (bucket, items) in buckets.iter().enumerate() {
+                let start = (phase * 2 + bucket) * work_capacity as usize;
+                work[start..start + items.len()].copy_from_slice(items);
+                let n = items.len() as u32;
+                let x = n.min(max_x);
+                counters[phase].work_count[bucket] = n;
+                // One workgroup per item, in rows of at most max_x (the task shader skips the excess).
+                counters[phase].args[bucket] = [x, if x == 0 { 1 } else { n.div_ceil(x) }, 1, 0];
+            }
+        }
+
         let frame = &mut self.frames[slot];
+        if self.meshlets {
+            frame.work.ensure(byte_len(&work))?;
+            frame.counters.ensure(byte_len(&counters))?;
+            frame.work.write(bytemuck::cast_slice(&work))?;
+            frame.counters.write(bytemuck::cast_slice(&counters))?;
+        }
         frame.uniforms.ensure(size_of::<FrameUniforms>() as u64)?;
         frame.materials.ensure(byte_len(materials))?;
         frame.draws.ensure(byte_len(&draws))?;
@@ -260,6 +355,23 @@ impl ForwardRenderer {
                 index_pool: self.meshes.index_pool(),
                 opaque,
                 blended,
+                meshlets: if self.meshlets {
+                    Some(MeshletIn {
+                        work: frame.work.handle(),
+                        work_address: frame.work.address()?,
+                        counters: frame.counters.handle(),
+                        counters_address: frame.counters.address()?,
+                        visibility: self.visibility.buffer(),
+                        visibility_address: if self.occlusion { self.visibility.address()? } else { 0 },
+                        work_capacity,
+                        flags: if self.meshlet_culling { MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING } else { 0 },
+                        lod_threshold: 1.0,
+                        occlusion: self.occlusion,
+                        counts: std::array::from_fn(|p| counters[p].work_count),
+                    })
+                } else {
+                    None
+                },
             },
             mapping: view.tone_mapping,
             target_format: HEADLESS_FORMAT,

@@ -69,6 +69,8 @@ pub struct Capabilities {
     pub max_draw_indirect_count: u32,
     /// Seconds-per-tick of GPU timestamps, in nanoseconds.
     pub timestamp_period_ns: f32,
+    /// The largest task shader dispatch in x (`maxTaskWorkGroupCount[0]`); 0 without mesh shaders.
+    pub max_task_workgroup_count_x: u32,
     /// The size of the bindless texture table.
     pub bindless_texture_capacity: u32,
 }

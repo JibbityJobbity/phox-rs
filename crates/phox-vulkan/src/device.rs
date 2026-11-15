@@ -62,6 +62,8 @@ pub(crate) struct BufferRes {
 pub(crate) struct TextureRes {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    /// One view per mip, for storage textures with several mips; otherwise empty.
+    pub mip_views: Vec<vk::ImageView>,
     pub allocation: Option<Allocation>,
     pub desc: TextureDesc,
 }
@@ -90,7 +92,7 @@ pub(crate) struct CommandEntry {
 
 pub(crate) enum Deferred {
     Buffer(vk::Buffer, Option<Allocation>),
-    Image(vk::Image, vk::ImageView, Option<Allocation>),
+    Image(vk::Image, Vec<vk::ImageView>, Option<Allocation>),
     Shader(vk::ShaderModule),
     Pipeline(vk::Pipeline, vk::PipelineLayout),
 }
@@ -202,8 +204,10 @@ impl Inner {
                         let _ = allocator.free(a);
                     }
                 }
-                Deferred::Image(image, view, allocation) => {
-                    self.device.destroy_image_view(view, None);
+                Deferred::Image(image, views, allocation) => {
+                    for view in views {
+                        self.device.destroy_image_view(view, None);
+                    }
                     self.device.destroy_image(image, None);
                     if let (Some(a), Some(allocator)) = (allocation, st.allocator.as_mut()) {
                         let _ = allocator.free(a);
@@ -268,7 +272,9 @@ impl Drop for Inner {
                 }
             }
             for t in st.textures.drain() {
-                self.device.destroy_image_view(t.view, None);
+                for view in std::iter::once(t.view).chain(t.mip_views) {
+                    self.device.destroy_image_view(view, None);
+                }
                 self.device.destroy_image(t.image, None);
                 if let (Some(a), Some(allocator)) = (t.allocation, st.allocator.as_mut()) {
                     let _ = allocator.free(a);
@@ -407,6 +413,7 @@ impl VulkanDevice {
             max_texture_size_2d: limits.max_image_dimension2_d,
             max_push_constant_bytes: limits.max_push_constants_size,
             max_draw_indirect_count: limits.max_draw_indirect_count,
+            max_task_workgroup_count_x: if selected.mesh_shaders { mesh_props.max_task_work_group_count[0] } else { 0 },
             timestamp_period_ns: limits.timestamp_period,
             bindless_texture_capacity: bindless_capacity,
         };
@@ -600,8 +607,15 @@ impl phox_rhi::Device for VulkanDevice {
             .format(format)
             .subresource_range(vk::ImageSubresourceRange { aspect_mask: convert::aspect(desc.format), base_mip_level: 0, level_count: desc.mips, base_array_layer: 0, layer_count: 1 });
         let view = unsafe { inner.device.create_image_view(&view_info, None) }.map_err(backend)?;
+        let mut mip_views = Vec::new();
+        if desc.usage.contains(TextureUsage::STORAGE) && desc.mips > 1 {
+            for mip in 0..desc.mips {
+                let mip_info = view_info.subresource_range(vk::ImageSubresourceRange { aspect_mask: convert::aspect(desc.format), base_mip_level: mip, level_count: 1, base_array_layer: 0, layer_count: 1 });
+                mip_views.push(unsafe { inner.device.create_image_view(&mip_info, None) }.map_err(backend)?);
+            }
+        }
         inner.set_name(image, &desc.debug_name);
-        Ok(st.textures.create(TextureRes { image, view, allocation: Some(allocation), desc: desc.clone() }))
+        Ok(st.textures.create(TextureRes { image, view, mip_views, allocation: Some(allocation), desc: desc.clone() }))
     }
 
     fn create_shader(&self, desc: &ShaderDesc) -> Result<ShaderHandle> {
@@ -634,7 +648,7 @@ impl phox_rhi::Device for VulkanDevice {
         let inner = &self.inner;
         let mut st = inner.lock();
         if let Some(t) = st.textures.destroy(handle) {
-            inner.defer(&mut st, Deferred::Image(t.image, t.view, t.allocation));
+            inner.defer(&mut st, Deferred::Image(t.image, std::iter::once(t.view).chain(t.mip_views).collect(), t.allocation));
         }
     }
 

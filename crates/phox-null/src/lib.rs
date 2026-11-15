@@ -55,6 +55,9 @@ impl CommandList for NullCommandList {
     fn bind_sampled_texture(&mut self, _: u32, _: u32, _: TextureHandle) {
         self.push("bindSampledTexture");
     }
+    fn bind_storage_texture(&mut self, _: u32, _: u32, _: TextureHandle, _: u32) {
+        self.push("bindStorageTexture");
+    }
     fn bind_bindless_table(&mut self, _: u32) {
         self.require(Feature::BindlessDescriptors, "bind_bindless_table");
         self.push("bindBindlessTable");

@@ -48,3 +48,47 @@ pub struct VertexDrawPushConstants {
 pub fn split_address(address: u64) -> [u32; 2] {
     [address as u32, (address >> 32) as u32]
 }
+
+/// `GpuDraw::flags`: single-sided, so meshlets facing away may be skipped.
+pub const DRAW_CONE_CULLING: u32 = 1;
+/// `GpuDraw::flags`: occlusion culling, the early pass drew this instance's visible meshlets.
+pub const DRAW_EARLY: u32 = 2;
+
+/// `MeshletDrawPushConstants::flags`.
+pub const MESHLET_FRUSTUM_CULLING: u32 = 1;
+pub const MESHLET_CONE_CULLING: u32 = 2;
+
+/// Per indirect draw of the meshlet path (task and mesh stages): which list of work items to run.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct MeshletDrawPushConstants {
+    pub draws: [u32; 2],
+    /// Bucket b's work items start at `b * work_capacity`.
+    pub work: [u32; 2],
+    pub counters: [u32; 2],
+    /// The meshlet visibility bits (occlusion culling).
+    pub visibility: [u32; 2],
+    pub bucket: u32,
+    pub work_capacity: u32,
+    pub flags: u32,
+    /// Cluster LOD: the error, in pixels, a meshlet may show.
+    pub lod_threshold: f32,
+}
+const _: () = assert!(size_of::<MeshletDrawPushConstants>() == 48);
+
+/// What one cull pass produced (DrawCounters): the work per bucket, and the indirect dispatch arguments of
+/// each bucket's task shader (`VkDrawMeshTasksIndirectCommandEXT`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct DrawCounters {
+    pub draw_count: u32,
+    pub work_count: [u32; 2],
+    pub padding: u32,
+    pub args: [[u32; 4]; 2],
+}
+const _: () = assert!(size_of::<DrawCounters>() == 48);
+
+/// Byte offset of bucket `bucket`'s indirect arguments inside a `DrawCounters`.
+pub const fn counters_args_offset(bucket: u32) -> u64 {
+    16 + 16 * bucket as u64
+}

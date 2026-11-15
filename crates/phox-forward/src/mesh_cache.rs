@@ -2,7 +2,7 @@
 //! one index pool every mesh shares, so a single indirect call can draw any of them.
 
 use crate::error::Result;
-use phox_core::meshlets::optimize_index_order;
+use phox_core::meshlets::{build_meshlets, optimize_index_order};
 use phox_core::scene::Mesh;
 use phox_rhi::*;
 use std::collections::HashMap;
@@ -19,11 +19,16 @@ pub struct GpuMeshInfo {
     /// Where its indices start in the index pool, in indices.
     pub first_index: u32,
     pub index_count: u32,
+    /// Mesh shading: the address of its meshlets, followed by their data (0 without mesh shading).
+    pub meshlet_address: u64,
+    /// Meshlets of every LOD level.
+    pub meshlet_count: u32,
 }
 
 struct Entry {
     version: u64,
     vertices: BufferHandle,
+    meshlets: BufferHandle,
     info: GpuMeshInfo,
     last_used: u64,
 }
@@ -33,6 +38,8 @@ struct Pending {
     version: u64,
     vertex_bytes: Vec<u8>,
     indices: Vec<u32>,
+    /// The meshlets then their data, as the shaders read them, and how many meshlets there are.
+    meshlets: Option<(Vec<u8>, u32)>,
 }
 
 /// Free ranges of the index pool, in indices.
@@ -89,10 +96,12 @@ pub struct MeshCache {
     pool_state: ResourceState,
     ranges: RangeAllocator,
     frame: u64,
+    meshlets: bool,
 }
 
 impl MeshCache {
-    pub fn new(device: Arc<dyn Device>) -> Result<Self> {
+    /// With `meshlets`, every mesh also gets a meshlet buffer for the task and mesh shaders.
+    pub fn new(device: Arc<dyn Device>, meshlets: bool) -> Result<Self> {
         let mut cache = Self {
             device,
             entries: HashMap::new(),
@@ -102,6 +111,7 @@ impl MeshCache {
             pool_state: ResourceState::Undefined,
             ranges: RangeAllocator::default(),
             frame: 0,
+            meshlets,
         };
         cache.pool = cache.create_pool(INITIAL_POOL_INDICES)?;
         cache.pool_capacity = INITIAL_POOL_INDICES;
@@ -125,10 +135,17 @@ impl MeshCache {
         let stale: Vec<u64> = self.entries.iter().filter(|(_, e)| frame - e.last_used > EVICT_AFTER_FRAMES).map(|(&id, _)| id).collect();
         for id in stale {
             if let Some(entry) = self.entries.remove(&id) {
-                self.device.destroy_buffer(entry.vertices);
-                self.ranges.release(u64::from(entry.info.first_index), u64::from(entry.info.index_count));
+                self.free_entry(&entry);
             }
         }
+    }
+
+    fn free_entry(&mut self, entry: &Entry) {
+        self.device.destroy_buffer(entry.vertices);
+        if entry.meshlets.is_valid() {
+            self.device.destroy_buffer(entry.meshlets);
+        }
+        self.ranges.release(u64::from(entry.info.first_index), u64::from(entry.info.index_count));
     }
 
     /// Marks `mesh` used this frame and queues its upload if it is new or its version changed. Its
@@ -143,13 +160,21 @@ impl MeshCache {
         if self.pending.iter().any(|p| p.mesh_id == mesh.id() && p.version == mesh.version()) {
             return;
         }
-        self.pending.push(Pending {
-            mesh_id: mesh.id(),
-            version: mesh.version(),
-            vertex_bytes: bytemuck::cast_slice(mesh.vertices()).to_vec(),
-            // The vertex path draws indices in vertex-cache order.
-            indices: optimize_index_order(mesh),
+        // The vertex path draws indices in vertex-cache order, and the meshlets are built from that order.
+        let indices = optimize_index_order(mesh);
+        let meshlets = self.meshlets.then(|| {
+            let mut built = build_meshlets(mesh, &indices);
+            // Offsets count from the start of the buffer, which holds the meshlets first.
+            let shift = (built.meshlets.len() * (size_of::<phox_core::meshlets::Meshlet>() / 4)) as u32;
+            for m in &mut built.meshlets {
+                m.vertex_offset += shift;
+                m.triangle_offset += shift;
+            }
+            let mut bytes: Vec<u8> = bytemuck::cast_slice(&built.meshlets).to_vec();
+            bytes.extend_from_slice(bytemuck::cast_slice(&built.data));
+            (bytes, built.meshlets.len() as u32)
         });
+        self.pending.push(Pending { mesh_id: mesh.id(), version: mesh.version(), vertex_bytes: bytemuck::cast_slice(mesh.vertices()).to_vec(), indices, meshlets });
     }
 
     pub fn get(&self, mesh: &Mesh) -> Option<GpuMeshInfo> {
@@ -166,8 +191,7 @@ impl MeshCache {
         // Replaced meshes give their old buffers back first.
         for p in &pending {
             if let Some(old) = self.entries.remove(&p.mesh_id) {
-                self.device.destroy_buffer(old.vertices);
-                self.ranges.release(u64::from(old.info.first_index), u64::from(old.info.index_count));
+                self.free_entry(&old);
             }
         }
         let needed: u64 = pending.iter().map(|p| p.indices.len() as u64).sum();
@@ -199,18 +223,11 @@ impl MeshCache {
 
         let mut barriers = Vec::new();
         for p in &pending {
-            let vertices = self.device.create_buffer(&BufferDesc {
-                size: p.vertex_bytes.len() as u64,
-                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
-                memory: MemoryKind::GpuOnly,
-                debug_name: format!("mesh {} vertices", p.mesh_id),
-                device_address: true,
-            })?;
-            let staging_vertices = self.device.create_buffer(&BufferDesc::new(p.vertex_bytes.len() as u64, BufferUsage::TRANSFER_SRC, MemoryKind::Upload, "vertex staging"))?;
-            self.device.write_buffer(staging_vertices, 0, &p.vertex_bytes)?;
-            cmd.barrier(&[], &[buffer_barrier(vertices, ResourceState::Undefined, ResourceState::TransferDst)]);
-            cmd.copy_buffer(staging_vertices, 0, vertices, 0, p.vertex_bytes.len() as u64);
-            barriers.push(buffer_barrier(vertices, ResourceState::TransferDst, ResourceState::ShaderRead));
+            let vertices = self.upload_storage(cmd.as_mut(), &p.vertex_bytes, &format!("mesh {} vertices", p.mesh_id), &mut barriers)?;
+            let (meshlets, meshlet_count) = match &p.meshlets {
+                Some((bytes, count)) => (self.upload_storage(cmd.as_mut(), bytes, &format!("mesh {} meshlets", p.mesh_id), &mut barriers)?, *count),
+                None => (BufferHandle::INVALID, 0),
+            };
 
             let index_bytes: &[u8] = bytemuck::cast_slice(&p.indices);
             let staging_indices = self.device.create_buffer(&BufferDesc::new(index_bytes.len() as u64, BufferUsage::TRANSFER_SRC, MemoryKind::Upload, "index staging"))?;
@@ -218,7 +235,6 @@ impl MeshCache {
             let first = self.ranges.allocate(p.indices.len() as u64, self.pool_capacity).expect("the pool was grown to fit");
             cmd.copy_buffer(staging_indices, 0, self.pool, first * 4, index_bytes.len() as u64);
             // The staging buffers are freed once the GPU is done with them.
-            self.device.destroy_buffer(staging_vertices);
             self.device.destroy_buffer(staging_indices);
 
             self.entries.insert(
@@ -226,7 +242,14 @@ impl MeshCache {
                 Entry {
                     version: p.version,
                     vertices,
-                    info: GpuMeshInfo { vertex_address: self.device.buffer_address(vertices)?, first_index: first as u32, index_count: p.indices.len() as u32 },
+                    meshlets,
+                    info: GpuMeshInfo {
+                        vertex_address: self.device.buffer_address(vertices)?,
+                        first_index: first as u32,
+                        index_count: p.indices.len() as u32,
+                        meshlet_address: if meshlets.is_valid() { self.device.buffer_address(meshlets)? } else { 0 },
+                        meshlet_count,
+                    },
                     last_used: self.frame,
                 },
             );
@@ -239,10 +262,35 @@ impl MeshCache {
     }
 }
 
+impl MeshCache {
+    /// A device-local buffer shaders read through its address, filled with `bytes` through a staging buffer.
+    /// Appends the barrier that makes it readable to `barriers`.
+    fn upload_storage(&self, cmd: &mut dyn CommandList, bytes: &[u8], name: &str, barriers: &mut Vec<BufferBarrier>) -> Result<BufferHandle> {
+        let buffer = self.device.create_buffer(&BufferDesc {
+            size: bytes.len() as u64,
+            usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+            memory: MemoryKind::GpuOnly,
+            debug_name: name.to_string(),
+            device_address: true,
+        })?;
+        let staging = self.device.create_buffer(&BufferDesc::new(bytes.len() as u64, BufferUsage::TRANSFER_SRC, MemoryKind::Upload, "staging"))?;
+        self.device.write_buffer(staging, 0, bytes)?;
+        cmd.barrier(&[], &[BufferBarrier { buffer, from: ResourceState::Undefined, to: ResourceState::TransferDst }]);
+        cmd.copy_buffer(staging, 0, buffer, 0, bytes.len() as u64);
+        barriers.push(BufferBarrier { buffer, from: ResourceState::TransferDst, to: ResourceState::ShaderRead });
+        // Freed once the GPU is done with it.
+        self.device.destroy_buffer(staging);
+        Ok(buffer)
+    }
+}
+
 impl Drop for MeshCache {
     fn drop(&mut self) {
         for entry in self.entries.values() {
             self.device.destroy_buffer(entry.vertices);
+            if entry.meshlets.is_valid() {
+                self.device.destroy_buffer(entry.meshlets);
+            }
         }
         self.device.destroy_buffer(self.pool);
     }

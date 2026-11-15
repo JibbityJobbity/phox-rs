@@ -13,6 +13,7 @@ enum Bound {
     Uniform(BufferHandle),
     Storage(BufferHandle),
     Texture(TextureHandle),
+    StorageImage(TextureHandle, u32),
 }
 
 struct CurrentPipeline {
@@ -190,6 +191,19 @@ impl VulkanCommandList {
                             // The sampler is immutable in the layout.
                             image_infos.push(vec![vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: res.view, image_layout: layout }]);
                             plan.push((b.binding, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, true, image_infos.len() - 1));
+                        }
+                        (BindingType::StorageTexture, Bound::StorageImage(h, mip)) => {
+                            let Ok(res) = st.textures.get(h) else {
+                                self.errors.push("a destroyed texture was bound".into());
+                                return;
+                            };
+                            let view = res.mip_views.get(mip as usize).copied().or((mip == 0).then_some(res.view));
+                            let Some(view) = view else {
+                                self.errors.push(format!("mip {mip} of a storage texture does not exist"));
+                                return;
+                            };
+                            image_infos.push(vec![vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }]);
+                            plan.push((b.binding, vk::DescriptorType::STORAGE_IMAGE, true, image_infos.len() - 1));
                         }
                         _ => {
                             self.errors.push(format!("set {set} binding {} is bound to the wrong kind of resource", b.binding));
@@ -391,6 +405,10 @@ impl CommandList for VulkanCommandList {
 
     fn bind_sampled_texture(&mut self, set: u32, binding: u32, texture: TextureHandle) {
         self.bind(set, binding, Bound::Texture(texture));
+    }
+
+    fn bind_storage_texture(&mut self, set: u32, binding: u32, texture: TextureHandle, mip: u32) {
+        self.bind(set, binding, Bound::StorageImage(texture, mip));
     }
 
     fn bind_bindless_table(&mut self, set: u32) {

@@ -101,6 +101,8 @@ pub trait CommandList: Send {
     fn bind_uniform_buffer(&mut self, set: u32, binding: u32, buffer: BufferHandle);
     fn bind_storage_buffer(&mut self, set: u32, binding: u32, buffer: BufferHandle);
     fn bind_sampled_texture(&mut self, set: u32, binding: u32, texture: TextureHandle);
+    /// Binds one mip of `texture` as a storage image (it must be in the `ShaderWrite` state).
+    fn bind_storage_texture(&mut self, set: u32, binding: u32, texture: TextureHandle, mip: u32);
     /// Binds the device's bindless texture table as descriptor set `set`.
     fn bind_bindless_table(&mut self, set: u32);
     fn push_constants(&mut self, stages: ShaderStages, offset: u32, data: &[u8]);
