@@ -18,6 +18,8 @@ pub enum ResourceState {
     Uniform,
     /// Indirect draw or dispatch arguments, which shaders may read too.
     IndirectArgs,
+    /// Read by the CPU once the frame has completed (a final state, for readback buffers).
+    HostRead,
     Present,
 }
 
@@ -35,6 +37,7 @@ impl ResourceState {
             ResourceState::VertexOrIndex => "VertexOrIndex",
             ResourceState::Uniform => "Uniform",
             ResourceState::IndirectArgs => "IndirectArgs",
+            ResourceState::HostRead => "HostRead",
             ResourceState::Present => "Present",
         }
     }

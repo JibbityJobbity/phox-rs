@@ -1,7 +1,8 @@
 //! `phox-sample`: renders a Phox sample scene, headless or in a window.
 //!
-//! Phase 1: headless rendering goes through the software rasterizer. The GPU options are parsed (so the
-//! interface is final) and reported as ignored until the Vulkan backend lands.
+//! Headless rendering goes through the forward technique on Vulkan, and falls back to the software
+//! rasterizer when there is no usable device. Windowed mode, cluster LOD and the mesh shader options arrive
+//! with later phases: they are parsed (so the interface is final) and reported as ignored until then.
 
 use phox_core::cpu_image::write_ppm;
 use phox_core::mesh_loader::load_mesh;
@@ -10,6 +11,8 @@ use phox_core::resources::Extent2D;
 use phox_core::sample_scenes::*;
 use phox_core::scene::ToneMapOperator;
 use phox_core::software_rasterizer::rasterize;
+use phox_forward::{ForwardRenderer, RendererConfig};
+use phox_vulkan::{VulkanConfig, VulkanDevice};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -146,7 +149,7 @@ fn scene_list() -> String {
     SAMPLE_SCENES.iter().map(|&id| sample_scene_name(id)).collect::<Vec<_>>().join(", ")
 }
 
-fn run(args: &Args) -> Result<(), CliError> {
+fn run(args: &Args) -> Result<i32, CliError> {
     let mut sample = if args.has("mesh") {
         let path = PathBuf::from(args.value("mesh"));
         let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -186,27 +189,112 @@ fn run(args: &Args) -> Result<(), CliError> {
     if args.flag("window") {
         return Err(CliError::Failed("--window needs the GPU renderer, which is not implemented yet".into()));
     }
-    for ignored in ["debug", "stats"].into_iter().filter(|f| args.flag(f)).chain(["device", "dump-graph"].into_iter().filter(|v| args.has(v))) {
-        log::warn!("--{ignored} has no effect on the software rasterizer");
+    if args.flag("stats") {
+        log::warn!("--stats needs cluster LOD, which is not implemented yet; ignored");
     }
 
-    println!("Rendering on the CPU with the software rasterizer");
-    // Without --animate every frame shows the same pose; only the last is written.
-    (sample.animate)(&mut sample.scene, time);
+    let output = if args.has("output") { PathBuf::from(args.value("output")) } else { PathBuf::from(format!("build/rendered_{}.ppm", sample.name)) };
     let frames = frames.max(1);
     let animate = args.flag("animate");
-    let mut image = None;
+    // Without --animate every frame shows the same pose, so the GPU does the same work each time.
+    (sample.animate)(&mut sample.scene, time);
+
+    let gpu = match VulkanDevice::new(&VulkanConfig {
+        validation: args.flag("debug"),
+        preferred_device: args.value("device").to_string(),
+        mesh_shaders: args.value("mesh-shaders") != "off",
+    }) {
+        Ok(device) => Some(device),
+        Err(e) => {
+            log::warn!("no usable Vulkan device ({e}); using the software rasterizer");
+            None
+        }
+    };
+    let Some(device) = gpu else {
+        println!("Rendering on the CPU with the software rasterizer");
+        let mut image = None;
+        for i in 0..frames {
+            if animate {
+                (sample.animate)(&mut sample.scene, time + i as f32 / 60.0);
+            }
+            image = Some(rasterize(&extract_view(&sample.scene, extent, true)));
+        }
+        write_ppm(&output, &image.expect("at least one frame is rendered"))?;
+        println!("Wrote {} (software rasterizer)", output.display());
+        return Ok(0);
+    };
+
+    println!("Rendering on {} with vertex shaders", device.info().name);
+    let config = RendererConfig { extent, capture_graph: args.has("dump-graph"), timestamps: true };
+    let mut renderer = ForwardRenderer::new(Arc::new(device.clone()), config).map_err(|e| CliError::Failed(e.to_string()))?;
+    // The first frames upload meshes and create pooled images, so they are left out of the averages.
+    const WARMUP_FRAMES: i64 = 3;
+    let mut timings = TimingAverages::default();
+    let mut graph_written = false;
     for i in 0..frames {
         if animate {
             (sample.animate)(&mut sample.scene, time + i as f32 / 60.0);
         }
-        image = Some(rasterize(&extract_view(&sample.scene, extent, true)));
+        renderer.render(&sample.scene).map_err(|e| CliError::Failed(e.to_string()))?;
+        if !graph_written && !renderer.frame_graph_dot().is_empty() {
+            let path = PathBuf::from(args.value("dump-graph"));
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| CliError::Failed(e.to_string()))?;
+            }
+            std::fs::write(&path, renderer.frame_graph_dot()).map_err(|e| CliError::Failed(format!("cannot write {}: {e}", path.display())))?;
+            println!("Wrote the frame graph to {}", path.display());
+            graph_written = true;
+        }
+        if i >= WARMUP_FRAMES || frames <= WARMUP_FRAMES {
+            timings.add(renderer.gpu_timings());
+        }
     }
-    let image = image.expect("at least one frame is rendered");
-    let output = if args.has("output") { PathBuf::from(args.value("output")) } else { PathBuf::from(format!("build/rendered_{}.ppm", sample.name)) };
-    write_ppm(&output, &image)?;
-    println!("Wrote {} (software rasterizer)", output.display());
-    Ok(())
+    if frames > 1 {
+        timings.print();
+    }
+    write_ppm(&output, renderer.last_frame())?;
+    println!("Wrote {} ({})", output.display(), device.info().name);
+    drop(renderer);
+    let (errors, warnings) = device.validation_counts();
+    if errors > 0 || warnings > 0 {
+        eprintln!("Validation reported {errors} error(s) and {warnings} warning(s)");
+        return Ok(3);
+    }
+    Ok(0)
+}
+
+/// Sums GPU pass times over frames, to print their averages.
+#[derive(Default)]
+struct TimingAverages {
+    totals: Vec<(String, f64)>,
+    frames: u32,
+}
+
+impl TimingAverages {
+    fn add(&mut self, timings: &[phox_forward::PassTiming]) {
+        if timings.is_empty() {
+            return;
+        }
+        for t in timings {
+            match self.totals.iter_mut().find(|(name, _)| *name == t.pass) {
+                Some((_, total)) => *total += t.milliseconds,
+                None => self.totals.push((t.pass.clone(), t.milliseconds)),
+            }
+        }
+        self.frames += 1;
+    }
+
+    fn print(&self) {
+        if self.frames == 0 {
+            return;
+        }
+        let n = f64::from(self.frames);
+        let mut line = format!("GPU time per frame, average of {} frame(s):", self.frames);
+        for (pass, total) in &self.totals {
+            line += &format!(" {pass} {:.3} ms,", total / n);
+        }
+        println!("{line} total {:.3} ms", self.totals.iter().map(|(_, t)| t).sum::<f64>() / n);
+    }
 }
 
 fn main() -> ExitCode {
@@ -227,7 +315,8 @@ fn main() -> ExitCode {
         }
     };
     match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status as u8),
         Err(CliError::Usage(message)) => {
             eprintln!("{message}\n\n{}", help());
             ExitCode::from(2)

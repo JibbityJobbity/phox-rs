@@ -39,6 +39,9 @@ pub trait Device: Send + Sync {
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, out: &mut [u8]) -> Result<()>;
     fn describe_texture(&self, handle: TextureHandle) -> Result<TextureDesc>;
     fn describe_buffer(&self, handle: BufferHandle) -> Result<BufferDesc>;
+    /// The device address of a buffer created with `device_address: true`, for shaders that read it through a
+    /// pointer.
+    fn buffer_address(&self, buffer: BufferHandle) -> Result<u64>;
 
     /// Puts `texture` (in the shader-read state) in the bindless table with `sampler`. Needs
     /// [`crate::Feature::BindlessDescriptors`].

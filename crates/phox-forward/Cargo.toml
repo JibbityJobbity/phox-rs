@@ -1,0 +1,19 @@
+[package]
+name = "phox-forward"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+phox-core = { path = "../phox-core" }
+phox-rhi = { path = "../phox-rhi" }
+bytemuck.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+phox-vulkan = { path = "../phox-vulkan" }
+phox-null = { path = "../phox-null" }
+serial_test.workspace = true
+env_logger.workspace = true

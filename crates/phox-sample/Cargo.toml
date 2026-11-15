@@ -10,4 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 phox-core = { path = "../phox-core" }
+phox-forward = { path = "../phox-forward" }
+phox-rhi = { path = "../phox-rhi" }
+phox-vulkan = { path = "../phox-vulkan" }
 log.workspace = true

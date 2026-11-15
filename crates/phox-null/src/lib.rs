@@ -298,6 +298,15 @@ impl Device for NullDevice {
         self.state().buffers.get(handle).map(|b| b.desc.clone())
     }
 
+    fn buffer_address(&self, buffer: BufferHandle) -> Result<u64> {
+        let state = self.state();
+        let b = state.buffers.get(buffer)?;
+        if !b.desc.device_address {
+            return Err(RhiError::Misuse(format!("buffer '{}' was not created with device_address", b.desc.debug_name)));
+        }
+        Ok((u64::from(buffer.index) + 1) << 32)
+    }
+
     fn register_bindless_texture(&self, texture: TextureHandle, _sampler: &SamplerDesc) -> Result<BindlessIndex> {
         let mut state = self.state();
         if !state.caps.has(Feature::BindlessDescriptors) {
