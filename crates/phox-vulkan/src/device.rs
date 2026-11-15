@@ -4,7 +4,8 @@ use crate::commands::VulkanCommandList;
 use crate::convert;
 use crate::instance::Instance;
 use crate::physical;
-use ash::{ext, vk};
+use ash::{ext, khr, vk};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc};
 use phox_rhi::pool::Pool;
@@ -68,6 +69,8 @@ pub(crate) struct TextureRes {
     /// One view per mip, for storage textures with several mips; otherwise empty.
     pub mip_views: Vec<vk::ImageView>,
     pub allocation: Option<Allocation>,
+    /// A swapchain image: the swapchain owns the image.
+    pub external: bool,
     pub desc: TextureDesc,
 }
 
@@ -98,6 +101,8 @@ pub(crate) enum Deferred {
     Image(vk::Image, Vec<vk::ImageView>, Option<Allocation>),
     Shader(vk::ShaderModule),
     Pipeline(vk::Pipeline, vk::PipelineLayout),
+    /// Views of a swapchain image, whose image the swapchain frees.
+    Views(Vec<vk::ImageView>),
 }
 
 pub(crate) struct BindlessTable {
@@ -127,14 +132,17 @@ pub(crate) struct State {
     pub samplers: HashMap<SamplerDesc, vk::Sampler>,
     pub set_layouts: HashMap<SetLayoutKey, vk::DescriptorSetLayout>,
     pub bindless: Option<BindlessTable>,
+    pub swapchain: Option<crate::swapchain::SwapchainState>,
 }
 
 pub(crate) struct Inner {
     pub device: ash::Device,
+    pub physical: vk::PhysicalDevice,
     pub queue: vk::Queue,
     pub queue_family: u32,
     pub mesh_loader: Option<ext::mesh_shader::Device>,
     pub debug_utils: Option<ext::debug_utils::Device>,
+    pub swapchain_loader: Option<khr::swapchain::Device>,
     pub caps: Capabilities,
     pub info: DeviceInfo,
     pub timeline: vk::Semaphore,
@@ -216,6 +224,11 @@ impl Inner {
                         let _ = allocator.free(a);
                     }
                 }
+                Deferred::Views(views) => {
+                    for view in views {
+                        self.device.destroy_image_view(view, None);
+                    }
+                }
                 Deferred::Shader(module) => self.device.destroy_shader_module(module, None),
                 Deferred::Pipeline(pipeline, layout) => {
                     self.device.destroy_pipeline(pipeline, None);
@@ -264,6 +277,7 @@ impl Drop for Inner {
         unsafe {
             let _ = self.device.device_wait_idle();
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            self.destroy_swapchain(&mut st);
             while let Some((_, item)) = st.deferred.pop_front() {
                 self.free_now(&mut st, item);
             }
@@ -327,7 +341,21 @@ impl VulkanDevice {
     /// Creates the instance, picks a device (see [`physical::select`]) and creates the logical device with
     /// the features Phox needs. Fails with a message when no device qualifies.
     pub fn new(config: &VulkanConfig) -> Result<Self> {
-        let instance = Instance::new(config.validation)?;
+        Self::create(config, None)
+    }
+
+    /// As [`VulkanDevice::new`], for a device that presents to a window: the instance gets the platform's
+    /// surface extensions, the device must be able to present to the window's surface, and
+    /// [`phox_rhi::Device::acquire_backbuffer`] works.
+    ///
+    /// # Safety
+    /// The window and display behind the handles must stay alive for as long as the device does.
+    pub unsafe fn new_for_window(config: &VulkanConfig, display: RawDisplayHandle, window: RawWindowHandle) -> Result<Self> {
+        Self::create(config, Some((display, window)))
+    }
+
+    fn create(config: &VulkanConfig, window: Option<(RawDisplayHandle, RawWindowHandle)>) -> Result<Self> {
+        let instance = Instance::new(config.validation, window)?;
         let preferred = if config.preferred_device.is_empty() { std::env::var("PHOX_DEVICE").unwrap_or_default() } else { config.preferred_device.clone() };
         let selected = physical::select(&instance, &preferred, config.mesh_shaders, config.draw_indirect_count)?;
 
@@ -340,6 +368,9 @@ impl VulkanDevice {
         }
         if selected.mesh_shaders {
             extensions.push(ext::mesh_shader::NAME.as_ptr());
+        }
+        if instance.surface.is_some() {
+            extensions.push(khr::swapchain::NAME.as_ptr());
         }
 
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
@@ -430,6 +461,7 @@ impl VulkanDevice {
         log::debug!("Vulkan device {} (mesh shaders: {}, indirect count: {})", info.name, info.mesh_shaders, info.draw_indirect_count);
 
         let mesh_loader = selected.mesh_shaders.then(|| ext::mesh_shader::Device::new(&instance.raw, &device));
+        let swapchain_loader = instance.surface.is_some().then(|| khr::swapchain::Device::new(&instance.raw, &device));
         let debug_utils = instance.validation.then(|| ext::debug_utils::Device::new(&instance.raw, &device));
         let state = State {
             allocator: Some(allocator),
@@ -445,13 +477,16 @@ impl VulkanDevice {
             samplers: HashMap::new(),
             set_layouts: HashMap::new(),
             bindless: None,
+            swapchain: None,
         };
         let inner = Arc::new(Inner {
             device,
+            physical: selected.physical,
             queue,
             queue_family: selected.queue_family,
             mesh_loader,
             debug_utils,
+            swapchain_loader,
             caps,
             info,
             timeline,
@@ -618,7 +653,7 @@ impl phox_rhi::Device for VulkanDevice {
             }
         }
         inner.set_name(image, &desc.debug_name);
-        Ok(st.textures.create(TextureRes { image, view, mip_views, allocation: Some(allocation), desc: desc.clone() }))
+        Ok(st.textures.create(TextureRes { image, view, mip_views, allocation: Some(allocation), external: false, desc: desc.clone() }))
     }
 
     fn create_shader(&self, desc: &ShaderDesc) -> Result<ShaderHandle> {
@@ -651,7 +686,8 @@ impl phox_rhi::Device for VulkanDevice {
         let inner = &self.inner;
         let mut st = inner.lock();
         if let Some(t) = st.textures.destroy(handle) {
-            inner.defer(&mut st, Deferred::Image(t.image, std::iter::once(t.view).chain(t.mip_views).collect(), t.allocation));
+            let views = std::iter::once(t.view).chain(t.mip_views).collect();
+            inner.defer(&mut st, if t.external { Deferred::Views(views) } else { Deferred::Image(t.image, views, t.allocation) });
         }
     }
 
@@ -771,6 +807,21 @@ impl phox_rhi::Device for VulkanDevice {
 
     fn wait_idle(&self) -> Result<()> {
         unsafe { self.inner.device.device_wait_idle() }.map_err(backend)
+    }
+
+    fn acquire_backbuffer(&self, width: u32, height: u32) -> Result<Option<Backbuffer>> {
+        self.inner.acquire_backbuffer(width, height)
+    }
+
+    fn submit_for_present(&self, commands: Box<dyn CommandList>, backbuffer: &Backbuffer) -> Result<SubmitTicket> {
+        let list = commands
+            .into_any()
+            .downcast::<VulkanCommandList>()
+            .map_err(|_| RhiError::Misuse("submit_for_present: the command list was not made by this device".into()))?;
+        let (acquire, render_finished) = self.inner.present_semaphores(backbuffer.index)?;
+        let ticket = list.submit_with(Some((acquire, render_finished)))?;
+        self.inner.present(backbuffer.index, render_finished)?;
+        Ok(ticket)
     }
 
     fn read_timestamps(&self, ticket: SubmitTicket) -> Result<Vec<Timestamp>> {

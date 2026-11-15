@@ -718,6 +718,8 @@ pub struct TonemapIn {
     pub extent: Extent2D,
     pub mapping: ToneMapping,
     pub target_format: Format,
+    /// A texture to write (the swapchain image); otherwise a transient is made.
+    pub target: Option<GraphTexture>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -773,7 +775,10 @@ impl TonemapPass {
     /// Adds the pass to `b`, which must be for the device `init` ran on.
     pub fn add<'g>(&mut self, b: &mut GraphBuilder<'g>, device: &dyn Device, input: &TonemapIn) -> GraphResult<TonemapOut> {
         let pipeline = self.pipeline(device, input.target_format)?;
-        let display = b.create_texture(&TextureDesc::new(input.extent.width, input.extent.height, input.target_format, TextureUsage::NONE, "display"));
+        let display = match input.target {
+            Some(target) => target,
+            None => b.create_texture(&TextureDesc::new(input.extent.width, input.extent.height, input.target_format, TextureUsage::NONE, "display")),
+        };
         let hdr = input.hdr;
         let constants = TonemapPushConstants {
             exposure: input.mapping.exposure,

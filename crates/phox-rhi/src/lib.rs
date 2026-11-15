@@ -14,7 +14,7 @@ pub mod pool;
 pub use capabilities::{Capabilities, Feature, FeatureSet};
 pub use commands::*;
 pub use descs::*;
-pub use device::{Device, SubmitTicket, Timestamp};
+pub use device::{Backbuffer, Device, SubmitTicket, Timestamp};
 pub use error::{Result, RhiError};
 pub use formats::*;
 pub use handles::*;

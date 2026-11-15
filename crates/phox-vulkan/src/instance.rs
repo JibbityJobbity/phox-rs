@@ -1,6 +1,7 @@
 //! The Vulkan instance, with the validation layer (and its synchronization checks) on request.
 
-use ash::{ext, vk};
+use ash::{ext, khr, vk};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use phox_rhi::{Result, RhiError};
 use std::ffi::{CStr, c_void};
 use std::sync::Arc;
@@ -57,6 +58,8 @@ pub struct Instance {
     pub validation: bool,
     pub counters: Arc<ValidationCounters>,
     messenger: Option<(ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    /// The window's surface, when presenting.
+    pub surface: Option<(khr::surface::Instance, vk::SurfaceKHR)>,
     counters_raw: *const ValidationCounters,
 }
 
@@ -71,7 +74,7 @@ fn backend(message: impl std::fmt::Display) -> RhiError {
 impl Instance {
     /// Loads the Vulkan library and creates an instance (API 1.3). `validation` enables the Khronos layer with
     /// synchronization validation, when it is installed.
-    pub fn new(validation: bool) -> Result<Self> {
+    pub fn new(validation: bool, window: Option<(RawDisplayHandle, RawWindowHandle)>) -> Result<Self> {
         // SAFETY: loading the system's Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| backend(format!("Vulkan is unavailable in this environment: {e}")))?;
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.map_err(backend)?;
@@ -90,6 +93,16 @@ impl Instance {
         if has(ash::khr::portability_enumeration::NAME) {
             extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
             flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+
+        // A window's surface needs the platform's surface extensions.
+        if let Some((display, _)) = window {
+            let required = ash_window::enumerate_required_extensions(display).map_err(|e| backend(format!("cannot present to this window system: {e}")))?;
+            for &name in required {
+                if !extensions.contains(&name) {
+                    extensions.push(name);
+                }
+            }
         }
 
         // Synchronization validation goes through VK_EXT_layer_settings, which the layer provides.
@@ -160,7 +173,15 @@ impl Instance {
         } else {
             None
         };
-        Ok(Self { entry, raw, validation, counters, messenger, counters_raw })
+        let surface = match window {
+            Some((display, handle)) => {
+                // SAFETY: the caller keeps the window alive as long as the device (see VulkanDevice::new_for_window).
+                let surface = unsafe { ash_window::create_surface(&entry, &raw, display, handle, None) }.map_err(|e| backend(format!("failed to create the window surface: {e}")))?;
+                Some((khr::surface::Instance::new(&entry, &raw), surface))
+            }
+            None => None,
+        };
+        Ok(Self { entry, raw, validation, counters, messenger, surface, counters_raw })
     }
 }
 
@@ -168,6 +189,9 @@ impl Drop for Instance {
     fn drop(&mut self) {
         // SAFETY: the instance is no longer used; the callback cannot run after the messenger is destroyed.
         unsafe {
+            if let Some((loader, surface)) = self.surface.take() {
+                loader.destroy_surface(surface, None);
+            }
             if let Some((loader, handle)) = self.messenger.take() {
                 loader.destroy_debug_utils_messenger(handle, None);
             }

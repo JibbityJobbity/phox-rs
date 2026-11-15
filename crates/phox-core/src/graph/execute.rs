@@ -6,6 +6,13 @@ impl<'g> GraphBuilder<'g> {
     /// Records every live pass (barriers, then its commands, inside rendering when it has targets) into one
     /// command list and submits it once. Needs a successful [`GraphBuilder::compile`].
     pub fn execute(&mut self) -> GraphResult<SubmitTicket> {
+        let commands = self.record()?;
+        Ok(self.graph.device.submit(commands)?)
+    }
+
+    /// Records every live pass into one command list without submitting it, for a device that submits it its
+    /// own way (presenting to a window, for one). Needs a successful [`GraphBuilder::compile`].
+    pub fn record(&mut self) -> GraphResult<Box<dyn phox_rhi::CommandList>> {
         if !self.data.compiled {
             return Err(GraphError::NotCompiled);
         }
@@ -72,7 +79,7 @@ impl<'g> GraphBuilder<'g> {
         if !data.final_texture_barriers.is_empty() || !data.final_buffer_barriers.is_empty() {
             cmd.barrier(&data.final_texture_barriers, &data.final_buffer_barriers);
         }
-        Ok(device.submit(cmd)?)
+        Ok(cmd)
     }
 
     /// Passes in order, whether each is live or culled, and the barriers before it. Used by tests.

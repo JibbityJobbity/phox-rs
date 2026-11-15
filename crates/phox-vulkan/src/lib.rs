@@ -9,6 +9,7 @@ mod device;
 mod instance;
 mod physical;
 mod pipeline;
+mod swapchain;
 
 pub use device::{DeviceInfo, VulkanConfig, VulkanDevice};
 pub use instance::ValidationCounters;

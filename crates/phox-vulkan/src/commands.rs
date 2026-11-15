@@ -85,7 +85,13 @@ impl VulkanCommandList {
         })
     }
 
-    pub(crate) fn submit(mut self: Box<Self>) -> Result<SubmitTicket> {
+    pub(crate) fn submit(self: Box<Self>) -> Result<SubmitTicket> {
+        self.submit_with(None)
+    }
+
+    /// Submits, optionally waiting for a binary semaphore first (the swapchain image is available) and
+    /// signalling another after (rendering is finished).
+    pub(crate) fn submit_with(mut self: Box<Self>, presenting: Option<(vk::Semaphore, vk::Semaphore)>) -> Result<SubmitTicket> {
         let inner = self.inner.clone();
         unsafe { inner.device.end_command_buffer(self.cb) }.map_err(backend)?;
         if let Some(error) = self.errors.first() {
@@ -97,8 +103,13 @@ impl VulkanCommandList {
         inner.collect(&mut st);
         let ticket = st.submitted + 1;
         let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cb)];
-        let signals = [vk::SemaphoreSubmitInfo::default().semaphore(inner.timeline).value(ticket).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let submit = vk::SubmitInfo2::default().command_buffer_infos(&command_buffers).signal_semaphore_infos(&signals);
+        let mut signals = vec![vk::SemaphoreSubmitInfo::default().semaphore(inner.timeline).value(ticket).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let mut waits = Vec::new();
+        if let Some((acquired, finished)) = presenting {
+            waits.push(vk::SemaphoreSubmitInfo::default().semaphore(acquired).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS));
+            signals.push(vk::SemaphoreSubmitInfo::default().semaphore(finished).stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS));
+        }
+        let submit = vk::SubmitInfo2::default().command_buffer_infos(&command_buffers).wait_semaphore_infos(&waits).signal_semaphore_infos(&signals);
         if let Err(e) = unsafe { inner.device.queue_submit2(inner.queue, &[submit], vk::Fence::null()) } {
             st.free_entries.push(entry);
             return Err(backend(format!("queue submit failed: {e}")));

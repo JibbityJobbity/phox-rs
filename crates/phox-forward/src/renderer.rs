@@ -75,6 +75,15 @@ pub struct FrameStatistics {
     pub lod_triangles: u64,
 }
 
+/// Where a frame ends up.
+#[derive(Clone, Copy)]
+enum Target {
+    /// Copied into this host-readable buffer.
+    Readback(BufferHandle),
+    /// Drawn into this swapchain image and presented.
+    Window(Backbuffer),
+}
+
 /// GPU time of one render graph pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PassTiming {
@@ -101,6 +110,8 @@ pub struct ForwardRenderer {
     dot: String,
     cpu_milliseconds: f64,
     statistics: FrameStatistics,
+    /// Submitted windowed frames whose GPU times have not been read yet.
+    timing_queue: std::collections::VecDeque<SubmitTicket>,
 }
 
 fn byte_len<T>(items: &[T]) -> u64 {
@@ -132,6 +143,7 @@ impl ForwardRenderer {
             dot: String::new(),
             cpu_milliseconds: 0.0,
             statistics: FrameStatistics::default(),
+            timing_queue: std::collections::VecDeque::new(),
             config,
             device,
         })
@@ -226,6 +238,46 @@ impl ForwardRenderer {
     /// Renders `scene` at the configured size and reads the image back: [`ForwardRenderer::last_frame`].
     pub fn render(&mut self, scene: &Scene) -> Result<()> {
         let extent = self.config.extent;
+        let readback = self.readback_buffer(extent)?;
+        let ticket = self.render_frame(scene, extent, HEADLESS_FORMAT, Target::Readback(readback))?;
+        // Headless: the frame is finished when render() returns.
+        self.device.wait(ticket)?;
+        let mut rgba = vec![0u8; extent.width as usize * extent.height as usize * 4];
+        self.device.read_buffer(readback, 0, &mut rgba)?;
+        self.last_frame = CpuImage { width: extent.width, height: extent.height, rgba };
+        self.timings = if self.timestamps_enabled() { pass_timings(&self.device.read_timestamps(ticket)?) } else { Vec::new() };
+        Ok(())
+    }
+
+    /// Renders `scene` into the window's next swapchain image (the size is the window's) and presents it.
+    /// Returns false when there was nothing to draw into (a minimized window). The device must have been
+    /// made for the window. GPU timings are those of a frame or two ago, the latest the GPU has finished.
+    pub fn render_window(&mut self, scene: &Scene, width: u32, height: u32) -> Result<bool> {
+        // Collect the timings of frames the GPU has finished with, in order.
+        while let Some(&ticket) = self.timing_queue.front() {
+            if !self.device.is_complete(ticket) {
+                break;
+            }
+            self.timing_queue.pop_front();
+            if self.timestamps_enabled() {
+                self.timings = pass_timings(&self.device.read_timestamps(ticket)?);
+            }
+        }
+        let Some(backbuffer) = self.device.acquire_backbuffer(width, height)? else { return Ok(false) };
+        let extent = Extent2D::new(backbuffer.width, backbuffer.height);
+        let ticket = self.render_frame(scene, extent, backbuffer.format, Target::Window(backbuffer))?;
+        if self.timestamps_enabled() {
+            self.timing_queue.push_back(ticket);
+        }
+        Ok(true)
+    }
+
+    fn timestamps_enabled(&self) -> bool {
+        self.config.timestamps && self.device.capabilities().has(Feature::Timestamps)
+    }
+
+    /// Records, compiles and submits one frame; returns its ticket.
+    fn render_frame(&mut self, scene: &Scene, extent: Extent2D, format: Format, target: Target) -> Result<SubmitTicket> {
         let slot_index = (self.frame_count % FRAMES_IN_FLIGHT as u64) as usize;
         // The frame slot's buffers are rewritten, so the frame that last used them must be done.
         if let Some(ticket) = self.frames[slot_index].ticket.take() {
@@ -238,41 +290,34 @@ impl ForwardRenderer {
         let view = extract_camera(scene, extent);
         // What changed since last frame goes to the GPU; the meshes and textures in use are uploaded.
         let frame = self.scene.update(scene, &view, &mut self.meshes, &mut self.textures)?;
-
         if self.config.collect_statistics {
             self.statistics = self.count_statistics(scene, &view);
         }
 
-        let readback = self.readback_buffer(extent)?;
-        let inputs = self.upload_frame(slot_index, &view, &frame, extent, readback)?;
-
+        let inputs = self.upload_frame(slot_index, &view, &frame, extent, format, target)?;
         self.technique.set_frame(inputs);
         let mut builder = self.graph.begin();
-        let timestamps = self.config.timestamps && self.device.capabilities().has(Feature::Timestamps);
-        builder.set_timestamps(timestamps);
+        builder.set_timestamps(self.config.timestamps && self.device.capabilities().has(Feature::Timestamps));
         self.technique.build(&mut builder)?;
         builder.compile()?;
         if self.config.capture_graph {
             self.dot = builder.to_dot()?;
         }
-        let ticket = builder.execute()?;
+        let commands = builder.record()?;
         drop(builder);
+        let ticket = match target {
+            Target::Readback(_) => self.device.submit(commands)?,
+            Target::Window(backbuffer) => self.device.submit_for_present(commands, &backbuffer)?,
+        };
         self.cpu_milliseconds = cpu_start.elapsed().as_secs_f64() * 1000.0;
         self.frames[slot_index].ticket = Some(ticket);
         self.frame_count += 1;
-
-        // Headless: the frame is finished when render() returns.
-        self.device.wait(ticket)?;
-        let mut rgba = vec![0u8; extent.width as usize * extent.height as usize * 4];
-        self.device.read_buffer(readback, 0, &mut rgba)?;
-        self.last_frame = CpuImage { width: extent.width, height: extent.height, rgba };
-        self.timings = if timestamps { pass_timings(&self.device.read_timestamps(ticket)?) } else { Vec::new() };
-        Ok(())
+        Ok(ticket)
     }
 
     /// Fills frame slot `slot`'s buffers for `view` and `frame`: the uniforms, the mesh table, what changed
     /// in the scene and the blended draws.
-    fn upload_frame(&mut self, slot: usize, view: &RenderView<'_>, frame: &SceneFrame, extent: Extent2D, readback: BufferHandle) -> Result<FrameInputs> {
+    fn upload_frame(&mut self, slot: usize, view: &RenderView<'_>, frame: &SceneFrame, extent: Extent2D, format: Format, target: Target) -> Result<FrameInputs> {
         let (w, h) = (extent.width as f32, extent.height as f32);
         let uniforms = FrameUniforms {
             view: view.view,
@@ -342,8 +387,9 @@ impl ForwardRenderer {
                 }),
             },
             mapping: view.tone_mapping,
-            target_format: HEADLESS_FORMAT,
-            readback: Some(readback),
+            target_format: format,
+            readback: if let Target::Readback(buffer) = target { Some(buffer) } else { None },
+            backbuffer: if let Target::Window(backbuffer) = target { Some(backbuffer) } else { None },
         })
     }
 }

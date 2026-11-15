@@ -49,12 +49,16 @@ pub fn select(instance: &Instance, preferred: &str, want_mesh_shaders: bool, wan
             continue;
         }
         let families = unsafe { instance.raw.get_physical_device_queue_family_properties(physical) };
-        let Some(queue_family) = families
-            .iter()
-            .position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER))
-        else {
+        // One family draws and presents, so images never change queue ownership.
+        let Some(queue_family) = families.iter().enumerate().position(|(i, f)| {
+            f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER)
+                && instance.surface.as_ref().is_none_or(|(loader, surface)| unsafe { loader.get_physical_device_surface_support(physical, i as u32, *surface) }.unwrap_or(false))
+        }) else {
             continue;
         };
+        if instance.surface.is_some() && !has_device_extension(instance, physical, ash::khr::swapchain::NAME) {
+            continue;
+        }
 
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default();

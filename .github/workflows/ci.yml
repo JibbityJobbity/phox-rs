@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rendering runs on lavapipe (set up below). The GPU tests must not skip for want of a device, and run
+  # with the validation layer (incl. synchronization validation), failing on any message.
+  PHOX_REQUIRE_GPU: 1
+  PHOX_VALIDATION: 1
+  # Opens a window on the virtual display (xvfb-run) in the CLI test.
+  PHOX_TEST_WINDOW: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain and a CPU Vulkan driver
+        run: |
+          sudo apt-get update
+          # glslang-tools: build.rs compiles shaders/* with glslangValidator. g++: meshoptimizer is built
+          # from vendor/ by the cc crate. mesa-vulkan-drivers is lavapipe. xvfb and the X libraries
+          # are for the windowed test.
+          sudo apt-get install -y --no-install-recommends \
+            g++ pkg-config glslang-tools libvulkan1 mesa-vulkan-drivers vulkan-validationlayers \
+            xvfb libx11-6 libxcb1 libxkbcommon-x11-0 libwayland-client0
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          # Point the Vulkan loader at lavapipe only, so tests never depend on whatever else is present.
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json | head -n 1)
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          echo "Using Vulkan driver manifest $icd"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: xvfb-run -a cargo test --workspace
+
+      # The mesh shader paths need Mesa with VK_EXT_mesh_shader (24.1 and later); they skip without it.
+      # The vertex path, the goldens and the validation checks run either way.
+
+      - name: upload images that did not match their golden
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-mismatches
+          path: "**/golden_out/"
+          if-no-files-found: ignore
+
+      - name: render the sample scenes with the CLI
+        run: |
+          cargo build --release -p phox-sample
+          mkdir -p out
+          for scene in triangle cubes tori materials; do
+            ./target/release/phox-sample --scene "$scene" --time 1 --debug \
+              --output "out/$scene.ppm" --dump-graph "out/$scene.dot"
+          done
+          ./target/release/phox-sample --scene cubes --time 1 --debug --mesh-shaders off \
+            --output out/cubes_vertex.ppm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renders
+          path: out/

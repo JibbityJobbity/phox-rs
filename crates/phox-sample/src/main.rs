@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod window;
+
 /// An option that takes a value, or a flag.
 struct Opt {
     name: &'static str,
@@ -170,7 +172,8 @@ fn run(args: &Args) -> Result<i32, CliError> {
     let extent = parse_size(args.value("size"))?;
 
     match args.value("backend") {
-        "vulkan" | "metal" => {}
+        "vulkan" => {}
+        "metal" => return Err(CliError::Failed("this build has no metal backend (the Metal backend is a stub in this version of Phox)".into())),
         _ => return Err(CliError::Usage("--backend expects vulkan or metal".into())),
     }
     if !matches!(args.value("mesh-shaders"), "on" | "off" | "noocclusion" | "nocull") {
@@ -187,7 +190,7 @@ fn run(args: &Args) -> Result<i32, CliError> {
         phox_core::log_setup::enable_debug();
     }
     if args.flag("window") {
-        return Err(CliError::Failed("--window needs the GPU renderer, which is not implemented yet".into()));
+        return run_window(args, sample, extent);
     }
     let output = if args.has("output") { PathBuf::from(args.value("output")) } else { PathBuf::from(format!("build/rendered_{}.ppm", sample.name)) };
     let frames = frames.max(1);
@@ -361,4 +364,44 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Windowed mode: present to a window until it is closed (or for `--frames` frames).
+fn run_window(args: &Args, mut sample: SampleScene, extent: Extent2D) -> Result<i32, CliError> {
+    let mode = args.value("mesh-shaders");
+    let config = RendererConfig {
+        extent,
+        capture_graph: false,
+        timestamps: true,
+        mesh_shaders: mode != "off",
+        meshlet_culling: mode != "nocull",
+        occlusion_culling: mode == "on",
+        mesh_lod: args.value("lod") == "on",
+        lod_error_pixels: args.number("lod-error")?,
+        collect_statistics: false,
+    };
+    let vulkan = VulkanConfig {
+        validation: args.flag("debug"),
+        preferred_device: args.value("device").to_string(),
+        mesh_shaders: mode != "off",
+        draw_indirect_count: true,
+    };
+    let frames: i64 = args.number("frames")?;
+    (sample.animate)(&mut sample.scene, 0.0);
+    let report = window::run(sample, vulkan, config, frames.max(0) as u64).map_err(CliError::Failed)?;
+    println!("Rendered on {}", report.device_name);
+    println!("Presented {} frame(s) in {:.3} s", report.frames, report.seconds);
+    if report.timed_frames > 0 {
+        let n = report.timed_frames as f64;
+        let mut line = format!("GPU time per frame, average of {} frame(s):", report.timed_frames);
+        for (pass, total) in &report.timings {
+            line += &format!(" {pass} {:.3} ms,", total / n);
+        }
+        println!("{line} total {:.3} ms", report.timings.iter().map(|(_, t)| t).sum::<f64>() / n);
+    }
+    if report.validation.0 > 0 || report.validation.1 > 0 {
+        eprintln!("Validation reported {} error(s) and {} warning(s)", report.validation.0, report.validation.1);
+        return Ok(3);
+    }
+    Ok(0)
 }

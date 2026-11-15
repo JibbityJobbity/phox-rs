@@ -37,11 +37,14 @@
             xorg.libXcursor
             xorg.libXrandr
             xorg.libXi
+            xorg.libxcb
           ];
         in pkgs.mkShell {
           name = "phox-rs";
 
-          packages = common pkgs ++ [ pkgs.gcc ];
+          # xorg.xorgserver provides Xvfb, a virtual display for testing windowed mode without a screen:
+          #   Xvfb :99 -screen 0 1280x720x24 & DISPLAY=:99 cargo run -p phox-sample -- --window --frames 60
+          packages = common pkgs ++ [ pkgs.gcc pkgs.xorg.xorgserver ];
 
           shellHook = ''
             export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath runtimeLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}

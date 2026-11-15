@@ -14,3 +14,8 @@ phox-forward = { path = "../phox-forward" }
 phox-rhi = { path = "../phox-rhi" }
 phox-vulkan = { path = "../phox-vulkan" }
 log.workspace = true
+winit = "0.30"
+raw-window-handle = "0.6"
+
+[dev-dependencies]
+phox-core = { path = "../phox-core" }

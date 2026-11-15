@@ -15,6 +15,8 @@ pub struct FrameInputs {
     pub target_format: Format,
     /// Headless: where the tonemapped image is copied.
     pub readback: Option<BufferHandle>,
+    /// Windowed: the swapchain image the tonemapped image is drawn into (ending in `Present`).
+    pub backbuffer: Option<Backbuffer>,
 }
 
 /// Forward rendering into HDR, then tone mapping into the target.
@@ -66,10 +68,11 @@ impl Technique for ForwardTechnique {
         let frame = self.frame.clone().ok_or_else(|| GraphError::Declaration("ForwardTechnique::build needs set_frame() first".into()))?;
         let forward = self.forward.setup(b, &frame.forward)?;
         let device = self.device.clone();
+        let target = frame.backbuffer.map(|bb| b.import_texture(bb.texture, ResourceState::Undefined, ResourceState::Present)).transpose()?;
         let tonemapped = self.tonemap.add(
             b,
             device.as_ref(),
-            &TonemapIn { hdr: forward.hdr, extent: frame.forward.extent, mapping: frame.mapping, target_format: frame.target_format },
+            &TonemapIn { hdr: forward.hdr, extent: frame.forward.extent, mapping: frame.mapping, target_format: frame.target_format, target },
         )?;
         if let Some(buffer) = frame.readback {
             self.readback.setup(b, &ReadbackIn { source: tonemapped.display, buffer })?;
