@@ -35,27 +35,7 @@ pub struct BlendRun {
     pub range: CommandRange,
 }
 
-/// Mesh shading: the work lists and counters the task shaders read, built by the renderer each frame.
-#[derive(Clone, Debug)]
-pub struct MeshletIn {
-    pub work: BufferHandle,
-    pub work_address: u64,
-    pub counters: BufferHandle,
-    pub counters_address: u64,
-    pub visibility: BufferHandle,
-    pub visibility_address: u64,
-    /// Work items per bucket and list.
-    pub work_capacity: u32,
-    /// `MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING`.
-    pub flags: u32,
-    pub lod_threshold: f32,
-    /// Two phases around a depth pyramid: draw what was visible last frame, then test the rest.
-    pub occlusion: bool,
-    /// Work items by list (plain, early, late) and bucket.
-    pub counts: [[u32; 2]; 3],
-}
-
-/// The lists of work a meshlet pass can run.
+/// The lists of work a meshlet pass can run, and which cull pass made them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Frustum and cone culling only.
@@ -66,23 +46,61 @@ pub enum Phase {
     Late = 2,
 }
 
-/// The buffers and draw ranges one frame's forward passes use (made by the renderer each frame).
+/// Mesh shading settings of a frame.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshletSettings {
+    /// `MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING`, or 0.
+    pub flags: u32,
+    /// Cluster LOD: the error, in pixels, a meshlet may show.
+    pub lod_threshold: f32,
+    /// Two phases around a depth pyramid: draw what was visible last frame, then test the rest.
+    pub occlusion: bool,
+}
+
+/// The buffers and counts one frame's forward passes use (made by the renderer each frame).
 #[derive(Clone, Debug)]
 pub struct ForwardIn {
     pub extent: Extent2D,
     pub clear_color: [f32; 4],
+    /// The frame's `FrameUniforms`.
     pub uniforms: BufferHandle,
+    /// The frame's `GpuMesh` table.
+    pub mesh_table: BufferHandle,
+    pub mesh_table_address: u64,
+    /// What changed in the scene since last frame (empty: nothing).
+    pub instance_updates: BufferHandle,
+    pub instance_updates_address: u64,
+    pub instance_update_count: u32,
+    pub material_updates: BufferHandle,
+    pub material_updates_address: u64,
+    pub material_update_count: u32,
+    /// The scene, kept on the GPU: a `GpuInstance` and a `MaterialData` per slot.
+    pub instances: BufferHandle,
+    pub instances_address: u64,
     pub materials: BufferHandle,
-    pub draws: BufferHandle,
-    pub draws_address: u64,
-    pub commands: BufferHandle,
+    pub materials_address: u64,
+    /// Occlusion culling: per slot visible last frame, and the meshlet visibility bits.
+    pub history: BufferHandle,
+    pub history_address: u64,
+    pub visibility: BufferHandle,
+    pub visibility_address: u64,
+    pub instance_count: u32,
+    /// Most draws, and most work per bucket, a cull pass can append (both at least 1).
+    pub draw_capacity: u32,
+    pub work_capacity: u32,
+    /// Vertex path: draws take the cull pass's count. Otherwise the command buffer is cleared first and drawn
+    /// whole, its unused commands drawing nothing.
+    pub draw_count: bool,
     pub index_pool: BufferHandle,
-    /// Vertex path: opaque and masked items by cull mode, `[both faces, back faces culled]`.
-    pub opaque: [CommandRange; 2],
-    /// Blended items draw back to front with vertex shaders, whichever path draws the rest.
+    /// The device's largest task shader dispatch in x.
+    pub max_groups_x: u32,
+    /// Blended objects, drawn back to front with vertex shaders: their draws, commands and runs.
+    pub blend_draws: BufferHandle,
+    pub blend_draws_address: u64,
+    pub blend_commands: BufferHandle,
     pub blended: Vec<BlendRun>,
-    /// Set when the opaque items are drawn by task and mesh shaders.
-    pub meshlets: Option<MeshletIn>,
+    /// Set when the opaque objects are drawn by task and mesh shaders.
+    pub meshlets: Option<MeshletSettings>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,9 +117,20 @@ pub struct ForwardOptions {
     pub occlusion: bool,
 }
 
-/// Draws the scene's objects, shades them with the PBR material table and draws blended objects last.
-/// Opaque objects use indexed indirect draws with vertex shaders, or task and mesh shaders over meshlets
-/// (with frustum, cone and occlusion culling); both read their vertices through device addresses.
+/// Which instance cull pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CullVariant {
+    Meshlets,
+    Early,
+    Late,
+    Vertex,
+}
+
+/// Draws the scene's objects, shades them with the PBR material table and draws blended objects last. The
+/// GPU does the rest: a scene update pass writes what changed, cull passes pick the visible objects and
+/// build the draw lists, and the opaque ones are drawn by indirect calls: indexed draws with vertex shaders,
+/// or task and mesh shaders over meshlets (with frustum, cone and occlusion culling). Everything reads its
+/// vertices through device addresses.
 #[derive(Default)]
 pub struct ForwardPass {
     vertex: ShaderHandle,
@@ -114,6 +143,10 @@ pub struct ForwardPass {
     blend: [PipelineHandle; 2],
     /// Task and mesh pipelines by phase and cull mode.
     meshlet: [[PipelineHandle; 2]; 3],
+    compute_shaders: Vec<ShaderHandle>,
+    scene_update: PipelineHandle,
+    cull: [PipelineHandle; 4],
+    args: PipelineHandle,
     pyramid: DepthPyramidPass,
     options: ForwardOptions,
 }
@@ -168,6 +201,17 @@ fn meshlet_pipeline_desc(shaders: [ShaderHandle; 3], cull: CullMode, phase: Phas
     }
 }
 
+fn compute_pipeline(device: &dyn Device, file: &str, bindings: Vec<Binding>, push_size: usize, shaders: &mut Vec<ShaderHandle>) -> Result<PipelineHandle> {
+    let shader = shader(device, ShaderStage::Compute, file)?;
+    shaders.push(shader);
+    Ok(device.create_compute_pipeline(&ComputePipelineDesc {
+        shader,
+        bindings,
+        push_constants: vec![PushConstantRange { stages: ShaderStages::COMPUTE, offset: 0, size: push_size as u32 }],
+        debug_name: file.to_string(),
+    })?)
+}
+
 impl ForwardPass {
     /// Creates the pipelines. Components create their device objects here, never in `setup`.
     pub fn init(&mut self, device: &dyn Device, options: ForwardOptions) -> Result<()> {
@@ -178,7 +222,14 @@ impl ForwardPass {
             self.opaque[i] = device.create_graphics_pipeline(&pipeline_desc(self.vertex, self.fragment, cull, false, "forward"))?;
             self.blend[i] = device.create_graphics_pipeline(&pipeline_desc(self.vertex, self.fragment, cull, true, "forward blend"))?;
         }
+        let compute = ShaderStages::COMPUTE;
+        let frame_set = || Binding::new(0, 0, BindingType::UniformBuffer, compute);
+        let cull_size = size_of::<CullPushConstants>();
+        self.scene_update = compute_pipeline(device, "scene_update.comp", vec![], size_of::<SceneUpdatePushConstants>(), &mut self.compute_shaders)?;
+        self.cull[CullVariant::Vertex as usize] = compute_pipeline(device, "cull_vertex.comp", vec![frame_set()], cull_size, &mut self.compute_shaders)?;
         if options.meshlets {
+            self.args = compute_pipeline(device, "draw_args.comp", vec![], size_of::<ArgsPushConstants>(), &mut self.compute_shaders)?;
+            self.cull[CullVariant::Meshlets as usize] = compute_pipeline(device, "cull.comp", vec![frame_set()], cull_size, &mut self.compute_shaders)?;
             self.mesh = shader(device, ShaderStage::Mesh, "forward.mesh")?;
             let phases = [(Phase::Plain, "forward.task"), (Phase::Early, "forward_early.task"), (Phase::Late, "forward_late.task")];
             for (phase, file) in phases {
@@ -193,6 +244,9 @@ impl ForwardPass {
                 }
             }
             if options.occlusion {
+                self.cull[CullVariant::Early as usize] = compute_pipeline(device, "cull_early.comp", vec![frame_set()], cull_size, &mut self.compute_shaders)?;
+                let pyramid_set = Binding { sampler: nearest_clamp(), ..Binding::new(1, 0, BindingType::SampledTexture, compute) };
+                self.cull[CullVariant::Late as usize] = compute_pipeline(device, "cull_late.comp", vec![frame_set(), pyramid_set], cull_size, &mut self.compute_shaders)?;
                 self.pyramid.init(device)?;
             }
         }
@@ -200,13 +254,16 @@ impl ForwardPass {
     }
 
     pub fn shutdown(&mut self, device: &dyn Device) {
-        for p in self.opaque.iter().chain(&self.blend).chain(self.meshlet.iter().flatten()) {
+        let pipelines = self.opaque.iter().chain(&self.blend).chain(self.meshlet.iter().flatten()).chain(&self.cull).chain([&self.scene_update, &self.args]);
+        for p in pipelines {
             device.destroy_pipeline(*p);
         }
-        for s in [self.vertex, self.fragment, self.mesh].into_iter().chain(self.tasks) {
+        for s in [self.vertex, self.fragment, self.mesh].into_iter().chain(self.tasks).chain(self.compute_shaders.iter().copied()) {
             device.destroy_shader(s);
         }
-        self.pyramid.shutdown(device);
+        if self.options.occlusion {
+            self.pyramid.shutdown(device);
+        }
         *self = Self::default();
     }
 }
@@ -233,86 +290,266 @@ fn draw_range(c: &mut PassContext<'_>, commands: GraphBuffer, range: CommandRang
     Ok(())
 }
 
-/// The graph resources a forward pass declares.
+/// The graph resources of the scene and the frame.
 #[derive(Clone, Copy)]
-struct FrameBuffers {
+struct SceneBuffers {
     uniforms: GraphBuffer,
+    mesh_table: GraphBuffer,
+    instances: GraphBuffer,
     materials: GraphBuffer,
-    draws: GraphBuffer,
-    commands: GraphBuffer,
-}
-
-fn declare_frame(p: &mut PassBuilder<'_>, f: FrameBuffers) -> GraphResult<()> {
-    p.read_buffer(f.uniforms, BufferAccess::Uniform)?;
-    p.read_buffer(f.materials, BufferAccess::ShaderRead)?;
-    p.read_buffer(f.draws, BufferAccess::ShaderRead)?;
-    p.read_buffer(f.commands, BufferAccess::Indirect)
-}
-
-/// The meshlet resources a pass declares: its counters (also the indirect arguments), its work, the
-/// visibility bits (`write`: the late phase records them) and, late, the depth pyramid.
-#[derive(Clone, Copy)]
-struct MeshletBuffers {
-    work: GraphBuffer,
-    counters: GraphBuffer,
-    /// Only with occlusion culling.
+    /// Occlusion culling only.
+    history: Option<GraphBuffer>,
     visibility: Option<GraphBuffer>,
 }
 
-fn declare_meshlets(p: &mut PassBuilder<'_>, m: MeshletBuffers, phase: Phase, pyramid: Option<GraphTexture>) -> GraphResult<()> {
-    p.read_buffer(m.counters, BufferAccess::Indirect)?;
-    p.read_buffer(m.work, BufferAccess::ShaderRead)?;
-    if let Some(visibility) = m.visibility {
-        match phase {
-            Phase::Plain => {}
-            Phase::Early => p.read_buffer(visibility, BufferAccess::ShaderRead)?,
-            Phase::Late => p.write_buffer(visibility, BufferAccess::ShaderWrite)?,
-        }
-    }
-    if let Some(pyramid) = pyramid {
-        p.read_texture(pyramid, TextureAccess::ShaderRead)?;
-    }
-    Ok(())
+/// One cull pass's output: what to draw, the work per bucket, and the counts (and dispatch arguments).
+#[derive(Clone, Copy)]
+struct DrawList {
+    draws: GraphBuffer,
+    work: GraphBuffer,
+    counters: GraphBuffer,
 }
 
-/// Draws one phase's task shader dispatches: a pipeline per cull bucket, run over that bucket's work items.
-#[allow(clippy::too_many_arguments)]
-fn draw_meshlets(
-    c: &mut PassContext<'_>,
-    input: &ForwardIn,
-    m: &MeshletIn,
-    phase: Phase,
-    pipelines: [PipelineHandle; 2],
-    f: FrameBuffers,
-    counters: GraphBuffer,
-    pyramid: Option<GraphTexture>,
-) -> GraphResult<()> {
-    let counters_buffer = c.buffer(counters)?;
-    let phase_index = phase as usize;
-    for bucket in 0..2u32 {
-        if m.counts[phase_index][bucket as usize] == 0 {
-            continue;
-        }
-        bind_frame(c, f.uniforms, f.materials, pipelines[bucket as usize])?;
-        if let Some(pyramid) = pyramid {
-            c.cmd.bind_sampled_texture(2, 0, c.texture(pyramid)?);
-        }
-        let work_bytes = u64::from(m.work_capacity) * 2 * 8; // items of two words, two buckets
-        let push = MeshletDrawPushConstants {
-            draws: split_address(input.draws_address),
-            work: split_address(m.work_address + phase_index as u64 * work_bytes),
-            counters: split_address(m.counters_address + (phase_index * size_of::<DrawCounters>()) as u64),
-            visibility: split_address(m.visibility_address),
-            bucket,
-            work_capacity: m.work_capacity,
-            flags: m.flags,
-            lod_threshold: m.lod_threshold,
-        };
-        c.cmd.push_constants(ShaderStages::TASK | ShaderStages::MESH, 0, bytemuck::bytes_of(&push));
-        let offset = (phase_index * size_of::<DrawCounters>()) as u64 + counters_args_offset(bucket);
-        c.cmd.draw_mesh_tasks_indirect(counters_buffer, offset, 1, 16);
+fn create_draw_list(b: &mut GraphBuilder<'_>, name: &str, input: &ForwardIn, meshlets: bool) -> DrawList {
+    // A work item is (draw, meshlet group); a draw command is a VkDrawIndexedIndirectCommand.
+    let entry = if meshlets { 8 } else { size_of::<DrawCommand>() as u64 };
+    let buffer = |size: u64, label: String| BufferDesc { size, usage: BufferUsage::NONE, memory: MemoryKind::GpuOnly, debug_name: label, device_address: true };
+    DrawList {
+        draws: b.create_buffer(&buffer(u64::from(input.draw_capacity) * size_of::<GpuDraw>() as u64, format!("{name} draws"))),
+        work: b.create_buffer(&buffer(2 * u64::from(input.work_capacity) * entry, format!("{name} work"))),
+        counters: b.create_buffer(&buffer(size_of::<DrawCounters>() as u64, format!("{name} counters"))),
     }
-    Ok(())
+}
+
+impl ForwardPass {
+    /// Writes what changed in the scene into its GPU arrays.
+    fn add_scene_update<'g>(&self, b: &mut GraphBuilder<'g>, input: &ForwardIn, scene: SceneBuffers) -> GraphResult<()> {
+        if input.instance_update_count == 0 && input.material_update_count == 0 {
+            return Ok(());
+        }
+        let instance_updates = b.import_buffer(input.instance_updates, ResourceState::Undefined, ResourceState::Undefined)?;
+        let material_updates = b.import_buffer(input.material_updates, ResourceState::Undefined, ResourceState::Undefined)?;
+        let (pipeline, i) = (self.scene_update, input.clone());
+        b.add_pass(
+            "scene update",
+            move |p| {
+                p.read_buffer(instance_updates, BufferAccess::ShaderRead)?;
+                p.read_buffer(material_updates, BufferAccess::ShaderRead)?;
+                p.write_buffer(scene.instances, BufferAccess::ShaderWrite)?;
+                p.write_buffer(scene.materials, BufferAccess::ShaderWrite)
+            },
+            move |c| {
+                c.cmd.bind_pipeline(pipeline);
+                let push = SceneUpdatePushConstants {
+                    instance_updates: split_address(i.instance_updates_address),
+                    material_updates: split_address(i.material_updates_address),
+                    instances: split_address(i.instances_address),
+                    materials: split_address(i.materials_address),
+                    instance_update_count: i.instance_update_count,
+                    material_update_count: i.material_update_count,
+                };
+                c.cmd.push_constants(ShaderStages::COMPUTE, 0, bytemuck::bytes_of(&push));
+                c.cmd.dispatch(i.instance_update_count.max(i.material_update_count).div_ceil(64), 1, 1);
+                Ok(())
+            },
+        )
+    }
+
+    /// Zeroes the counters of `lists` (and, drawing without a count, the vertex path's commands).
+    fn add_clear<'g>(&self, b: &mut GraphBuilder<'g>, input: &ForwardIn, lists: &[DrawList], meshlets: bool) -> GraphResult<()> {
+        let clear_work = !meshlets && !input.draw_count;
+        let lists = lists.to_vec();
+        let l = lists.clone();
+        b.add_pass(
+            "clear draw counters",
+            move |p| {
+                for list in &l {
+                    p.write_buffer(list.counters, BufferAccess::TransferDst)?;
+                    if clear_work {
+                        p.write_buffer(list.work, BufferAccess::TransferDst)?;
+                    }
+                }
+                Ok(())
+            },
+            move |c| {
+                for list in &lists {
+                    let counters = c.buffer(list.counters)?;
+                    c.cmd.fill_buffer(counters, 0, size_of::<DrawCounters>() as u64, 0);
+                    if clear_work {
+                        let work = c.buffer(list.work)?;
+                        let size = c.device.describe_buffer(work)?.size;
+                        c.cmd.fill_buffer(work, 0, size, 0);
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// The instance cull pass: appends what `variant` keeps to `list`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_cull<'g>(&self, b: &mut GraphBuilder<'g>, name: &str, variant: CullVariant, input: &ForwardIn, scene: SceneBuffers, list: DrawList, pyramid: Option<GraphTexture>) -> GraphResult<()> {
+        let (pipeline, i) = (self.cull[variant as usize], input.clone());
+        let frustum = input.meshlets.is_none_or(|m| m.flags & MESHLET_FRUSTUM_CULLING != 0);
+        b.add_pass(
+            name,
+            move |p| {
+                p.read_buffer(scene.uniforms, BufferAccess::Uniform)?;
+                p.read_buffer(scene.instances, BufferAccess::ShaderRead)?;
+                p.read_buffer(scene.mesh_table, BufferAccess::ShaderRead)?;
+                p.write_buffer(list.draws, BufferAccess::ShaderWrite)?;
+                p.write_buffer(list.work, BufferAccess::ShaderWrite)?;
+                p.write_buffer(list.counters, BufferAccess::ShaderWrite)?;
+                match (variant, scene.history) {
+                    (CullVariant::Early, Some(history)) => p.read_buffer(history, BufferAccess::ShaderRead)?,
+                    (CullVariant::Late, Some(history)) => p.write_buffer(history, BufferAccess::ShaderWrite)?,
+                    _ => {}
+                }
+                if let Some(pyramid) = pyramid {
+                    p.read_texture(pyramid, TextureAccess::ShaderRead)?;
+                }
+                Ok(())
+            },
+            move |c| {
+                c.cmd.bind_pipeline(pipeline);
+                c.cmd.bind_uniform_buffer(0, 0, c.buffer(scene.uniforms)?);
+                if let Some(pyramid) = pyramid {
+                    c.cmd.bind_sampled_texture(1, 0, c.texture(pyramid)?);
+                }
+                let address = |c: &PassContext<'_>, buffer: GraphBuffer| -> GraphResult<[u32; 2]> { Ok(split_address(c.device.buffer_address(c.buffer(buffer)?)?)) };
+                let push = CullPushConstants {
+                    instances: split_address(i.instances_address),
+                    meshes: split_address(i.mesh_table_address),
+                    draws: address(c, list.draws)?,
+                    work: address(c, list.work)?,
+                    counters: address(c, list.counters)?,
+                    history: split_address(i.history_address),
+                    instance_count: i.instance_count,
+                    work_capacity: i.work_capacity,
+                    flags: if frustum { CULL_FRUSTUM } else { 0 },
+                    padding: 0,
+                };
+                c.cmd.push_constants(ShaderStages::COMPUTE, 0, bytemuck::bytes_of(&push));
+                c.cmd.dispatch(i.instance_count.div_ceil(64).max(1), 1, 1);
+                Ok(())
+            },
+        )
+    }
+
+    /// Turns `list`'s work counts into task shader dispatch arguments.
+    fn add_args<'g>(&self, b: &mut GraphBuilder<'g>, name: &str, input: &ForwardIn, list: DrawList) -> GraphResult<()> {
+        let (pipeline, max_x) = (self.args, input.max_groups_x);
+        b.add_pass(
+            name,
+            move |p| p.write_buffer(list.counters, BufferAccess::ShaderWrite),
+            move |c| {
+                c.cmd.bind_pipeline(pipeline);
+                let counters = c.device.buffer_address(c.buffer(list.counters)?)?;
+                let push = ArgsPushConstants { counters: split_address(counters), max_groups_x: max_x, padding: 0 };
+                c.cmd.push_constants(ShaderStages::COMPUTE, 0, bytemuck::bytes_of(&push));
+                c.cmd.dispatch(1, 1, 1);
+                Ok(())
+            },
+        )
+    }
+
+    /// One pass drawing `list`: task and mesh shaders over its work items, or its indexed draws.
+    #[allow(clippy::too_many_arguments)]
+    fn add_draw<'g>(
+        &self,
+        b: &mut GraphBuilder<'g>,
+        name: &str,
+        input: &ForwardIn,
+        scene: SceneBuffers,
+        list: DrawList,
+        phase: Phase,
+        target: (GraphTexture, GraphTexture),
+        first: bool,
+        pyramid: Option<GraphTexture>,
+    ) -> GraphResult<()> {
+        let (hdr, depth) = target;
+        let clear = input.clear_color;
+        let (meshlet_settings, i) = (input.meshlets, input.clone());
+        let pipelines = if meshlet_settings.is_some() { self.meshlet[phase as usize] } else { self.opaque };
+        let meshlets = meshlet_settings.is_some();
+        b.add_pass(
+            name,
+            move |p| {
+                if first {
+                    p.color_target_with(hdr, true, clear)?;
+                    p.depth_target(depth)?;
+                } else {
+                    p.color_target_load(hdr)?;
+                    p.depth_target_with(depth, false, 1.0)?;
+                }
+                p.read_buffer(scene.uniforms, BufferAccess::Uniform)?;
+                p.read_buffer(scene.materials, BufferAccess::ShaderRead)?; // set 0's material table
+                p.read_buffer(list.draws, BufferAccess::ShaderRead)?;
+                p.read_buffer(list.counters, BufferAccess::Indirect)?;
+                // Work items are read by the task shader; draw commands by the draw itself.
+                p.read_buffer(list.work, if meshlets { BufferAccess::ShaderRead } else { BufferAccess::Indirect })?;
+                if let Some(visibility) = scene.visibility {
+                    match phase {
+                        Phase::Early => p.read_buffer(visibility, BufferAccess::ShaderRead)?,
+                        Phase::Late => p.write_buffer(visibility, BufferAccess::ShaderWrite)?,
+                        Phase::Plain => {}
+                    }
+                }
+                if let Some(pyramid) = pyramid {
+                    p.read_texture(pyramid, TextureAccess::ShaderRead)?;
+                }
+                Ok(())
+            },
+            move |c| {
+                let draws = c.device.buffer_address(c.buffer(list.draws)?)?;
+                let work = c.buffer(list.work)?;
+                let counters = c.buffer(list.counters)?;
+                if let Some(m) = meshlet_settings {
+                    let (work_address, counters_address) = (c.device.buffer_address(work)?, c.device.buffer_address(counters)?);
+                    for bucket in 0..2u32 {
+                        bind_frame(c, scene.uniforms, scene.materials, pipelines[bucket as usize])?;
+                        if let Some(pyramid) = pyramid {
+                            c.cmd.bind_sampled_texture(2, 0, c.texture(pyramid)?);
+                        }
+                        let push = MeshletDrawPushConstants {
+                            draws: split_address(draws),
+                            work: split_address(work_address),
+                            counters: split_address(counters_address),
+                            visibility: split_address(i.visibility_address),
+                            bucket,
+                            work_capacity: i.work_capacity,
+                            flags: m.flags,
+                            lod_threshold: m.lod_threshold,
+                        };
+                        c.cmd.push_constants(ShaderStages::TASK | ShaderStages::MESH, 0, bytemuck::bytes_of(&push));
+                        c.cmd.draw_mesh_tasks_indirect(counters, counters_args_offset(bucket), 1, 16);
+                    }
+                } else {
+                    c.cmd.bind_index_buffer(i.index_pool, 0);
+                    let stride = size_of::<DrawCommand>() as u32;
+                    for bucket in 0..2u32 {
+                        bind_frame(c, scene.uniforms, scene.materials, pipelines[bucket as usize])?;
+                        let push = VertexDrawPushConstants { draws: split_address(draws) };
+                        c.cmd.push_constants(ShaderStages::VERTEX, 0, bytemuck::bytes_of(&push));
+                        let offset = u64::from(bucket) * u64::from(i.work_capacity) * u64::from(stride);
+                        if i.draw_count {
+                            c.cmd.draw_indexed_indirect_count(work, offset, counters, 4 + 4 * u64::from(bucket), i.work_capacity, stride);
+                        } else {
+                            // In calls of at most maxDrawIndirectCount, which may be as low as 2^16 - 1.
+                            let limit = c.device.capabilities().max_draw_indirect_count.max(1);
+                            let mut at = 0;
+                            while at < i.work_capacity {
+                                let n = limit.min(i.work_capacity - at);
+                                c.cmd.draw_indexed_indirect(work, offset + u64::from(at) * u64::from(stride), n, stride);
+                                at += n;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
 }
 
 impl Component for ForwardPass {
@@ -327,115 +564,76 @@ impl Component for ForwardPass {
         b.require(Feature::BindlessDescriptors);
         if input.meshlets.is_some() {
             b.require(Feature::MeshShader);
+        } else if input.draw_count {
+            b.require(Feature::DrawIndirectCount);
         }
         let (w, h) = (input.extent.width, input.extent.height);
         let hdr = b.create_texture(&TextureDesc::new(w, h, HDR_FORMAT, TextureUsage::NONE, "hdr"));
         let depth = b.create_texture(&TextureDesc::new(w, h, DEPTH_FORMAT, TextureUsage::NONE, "depth"));
-        let frame = FrameBuffers {
-            uniforms: b.import_buffer(input.uniforms, ResourceState::Undefined, ResourceState::Undefined)?,
-            materials: b.import_buffer(input.materials, ResourceState::Undefined, ResourceState::Undefined)?,
-            draws: b.import_buffer(input.draws, ResourceState::Undefined, ResourceState::Undefined)?,
-            commands: b.import_buffer(input.commands, ResourceState::Undefined, ResourceState::Undefined)?,
+        let import = |b: &mut GraphBuilder<'g>, buffer: BufferHandle| b.import_buffer(buffer, ResourceState::Undefined, ResourceState::Undefined);
+        let occlusion = input.meshlets.is_some_and(|m| m.occlusion);
+        let scene = SceneBuffers {
+            uniforms: import(b, input.uniforms)?,
+            mesh_table: import(b, input.mesh_table)?,
+            instances: import(b, input.instances)?,
+            materials: import(b, input.materials)?,
+            history: if occlusion { Some(import(b, input.history)?) } else { None },
+            visibility: if occlusion { Some(import(b, input.visibility)?) } else { None },
         };
-        let clear = input.clear_color;
+        self.add_scene_update(b, input, scene)?;
 
-        if let Some(m) = &input.meshlets {
-            let buffers = MeshletBuffers {
-                work: b.import_buffer(m.work, ResourceState::Undefined, ResourceState::Undefined)?,
-                counters: b.import_buffer(m.counters, ResourceState::Undefined, ResourceState::Undefined)?,
-                visibility: if m.occlusion { Some(b.import_buffer(m.visibility, ResourceState::Undefined, ResourceState::Undefined)?) } else { None },
-            };
-            let pipelines = self.meshlet;
-            let early_input = input.clone();
-            if m.occlusion {
+        match input.meshlets {
+            Some(m) if m.occlusion => {
                 // Draw what was visible last frame, build a depth pyramid from it, then test everything
                 // else against the pyramid and draw what is newly visible.
-                b.add_pass(
-                    "forward early",
-                    move |p| {
-                        p.color_target_with(hdr, true, clear)?;
-                        p.depth_target(depth)?;
-                        declare_frame(p, frame)?;
-                        declare_meshlets(p, buffers, Phase::Early, None)
-                    },
-                    move |c| {
-                        let m = early_input.meshlets.as_ref().expect("meshlet input");
-                        draw_meshlets(c, &early_input, m, Phase::Early, pipelines[Phase::Early as usize], frame, buffers.counters, None)
-                    },
-                )?;
+                let (early, late) = (create_draw_list(b, "early", input, true), create_draw_list(b, "late", input, true));
+                self.add_clear(b, input, &[early, late], true)?;
+                self.add_cull(b, "cull early", CullVariant::Early, input, scene, early, None)?;
+                self.add_args(b, "draw args early", input, early)?;
+                self.add_draw(b, "forward early", input, scene, early, Phase::Early, (hdr, depth), true, None)?;
                 let pyramid = self.pyramid.add(b, depth, input.extent)?;
-                let late_input = input.clone();
-                b.add_pass(
-                    "forward late",
-                    move |p| {
-                        p.color_target_load(hdr)?;
-                        p.depth_target_with(depth, false, 1.0)?;
-                        declare_frame(p, frame)?;
-                        declare_meshlets(p, buffers, Phase::Late, Some(pyramid))
-                    },
-                    move |c| {
-                        let m = late_input.meshlets.as_ref().expect("meshlet input");
-                        draw_meshlets(c, &late_input, m, Phase::Late, pipelines[Phase::Late as usize], frame, buffers.counters, Some(pyramid))
-                    },
-                )?;
-            } else {
-                b.add_pass(
-                    "forward",
-                    move |p| {
-                        p.color_target_with(hdr, true, clear)?;
-                        p.depth_target(depth)?;
-                        declare_frame(p, frame)?;
-                        declare_meshlets(p, buffers, Phase::Plain, None)
-                    },
-                    move |c| {
-                        let m = early_input.meshlets.as_ref().expect("meshlet input");
-                        draw_meshlets(c, &early_input, m, Phase::Plain, pipelines[Phase::Plain as usize], frame, buffers.counters, None)
-                    },
-                )?;
+                self.add_cull(b, "cull late", CullVariant::Late, input, scene, late, Some(pyramid))?;
+                self.add_args(b, "draw args late", input, late)?;
+                self.add_draw(b, "forward late", input, scene, late, Phase::Late, (hdr, depth), false, Some(pyramid))?;
             }
-        } else {
-            let pipelines = self.opaque;
-            let opaque_input = input.clone();
-            b.add_pass(
-                "forward",
-                move |p| {
-                    p.color_target_with(hdr, true, clear)?;
-                    p.depth_target(depth)?;
-                    declare_frame(p, frame)
-                },
-                move |c| {
-                    c.cmd.bind_index_buffer(opaque_input.index_pool, 0);
-                    for (bucket, range) in opaque_input.opaque.iter().enumerate() {
-                        if range.count > 0 {
-                            bind_frame(c, frame.uniforms, frame.materials, pipelines[bucket])?;
-                            let push = VertexDrawPushConstants { draws: split_address(opaque_input.draws_address) };
-                            c.cmd.push_constants(ShaderStages::VERTEX, 0, bytemuck::bytes_of(&push));
-                            draw_range(c, frame.commands, *range)?;
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
+            Some(_) => {
+                let list = create_draw_list(b, "frame", input, true);
+                self.add_clear(b, input, &[list], true)?;
+                self.add_cull(b, "cull", CullVariant::Meshlets, input, scene, list, None)?;
+                self.add_args(b, "draw args", input, list)?;
+                self.add_draw(b, "forward", input, scene, list, Phase::Plain, (hdr, depth), true, None)?;
+            }
+            None => {
+                let list = create_draw_list(b, "frame", input, false);
+                self.add_clear(b, input, &[list], false)?;
+                self.add_cull(b, "cull", CullVariant::Vertex, input, scene, list, None)?;
+                self.add_draw(b, "forward", input, scene, list, Phase::Plain, (hdr, depth), true, None)?;
+            }
         }
 
         if !input.blended.is_empty() {
             // Blended items follow, back to front: depth tested but not written, over the opaque result.
             let blended_input = input.clone();
             let blend_pipelines = self.blend;
+            let blend_draws = import(b, input.blend_draws)?;
+            let blend_commands = import(b, input.blend_commands)?;
             b.add_pass(
                 "forward blend",
                 move |p| {
                     p.color_target_load(hdr)?;
                     p.depth_read(depth)?;
-                    declare_frame(p, frame)
+                    p.read_buffer(scene.uniforms, BufferAccess::Uniform)?;
+                    p.read_buffer(scene.materials, BufferAccess::ShaderRead)?;
+                    p.read_buffer(blend_draws, BufferAccess::ShaderRead)?;
+                    p.read_buffer(blend_commands, BufferAccess::Indirect)
                 },
                 move |c| {
                     c.cmd.bind_index_buffer(blended_input.index_pool, 0);
                     for run in &blended_input.blended {
-                        bind_frame(c, frame.uniforms, frame.materials, blend_pipelines[usize::from(run.cull_back_faces)])?;
-                        let push = VertexDrawPushConstants { draws: split_address(blended_input.draws_address) };
+                        bind_frame(c, scene.uniforms, scene.materials, blend_pipelines[usize::from(run.cull_back_faces)])?;
+                        let push = VertexDrawPushConstants { draws: split_address(blended_input.blend_draws_address) };
                         c.cmd.push_constants(ShaderStages::VERTEX, 0, bytemuck::bytes_of(&push));
-                        draw_range(c, frame.commands, run.range)?;
+                        draw_range(c, blend_commands, run.range)?;
                     }
                     Ok(())
                 },

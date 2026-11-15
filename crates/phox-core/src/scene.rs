@@ -947,4 +947,10 @@ impl Scene {
     pub fn object_count(&self) -> usize {
         self.objects.len()
     }
+
+    /// One more than the largest `ObjectId::index` ever handed out: how many slots per-object state indexed by
+    /// `ObjectId::index` needs.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
 }

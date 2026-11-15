@@ -4,6 +4,7 @@
 
 mod error;
 mod frame;
+mod gpu_scene;
 mod gpu_types;
 mod mesh_cache;
 mod passes;
@@ -11,7 +12,6 @@ mod renderer;
 pub mod shaders;
 mod technique;
 mod texture_cache;
-mod visibility;
 
 pub use error::{ForwardError, Result};
 pub use gpu_types::{DrawCommand, GpuDraw, VertexDrawPushConstants};

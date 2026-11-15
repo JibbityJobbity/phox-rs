@@ -33,11 +33,14 @@ pub struct VulkanConfig {
     pub preferred_device: String,
     /// Use task and mesh shaders where the device has them.
     pub mesh_shaders: bool,
+    /// Use `drawIndirectCount` where the device has it (the environment's `PHOX_NO_DRAW_INDIRECT_COUNT=1`
+    /// turns it off too). Off tests the path for devices without it, such as MoltenVK.
+    pub draw_indirect_count: bool,
 }
 
 impl Default for VulkanConfig {
     fn default() -> Self {
-        Self { validation: false, preferred_device: String::new(), mesh_shaders: true }
+        Self { validation: false, preferred_device: String::new(), mesh_shaders: true, draw_indirect_count: true }
     }
 }
 
@@ -326,7 +329,7 @@ impl VulkanDevice {
     pub fn new(config: &VulkanConfig) -> Result<Self> {
         let instance = Instance::new(config.validation)?;
         let preferred = if config.preferred_device.is_empty() { std::env::var("PHOX_DEVICE").unwrap_or_default() } else { config.preferred_device.clone() };
-        let selected = physical::select(&instance, &preferred, config.mesh_shaders)?;
+        let selected = physical::select(&instance, &preferred, config.mesh_shaders, config.draw_indirect_count)?;
 
         let priority = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(selected.queue_family).queue_priorities(&priority)];

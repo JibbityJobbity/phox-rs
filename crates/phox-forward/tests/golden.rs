@@ -85,6 +85,10 @@ fn device() -> Option<VulkanDevice> {
     }
 }
 
+fn device_without_indirect_count() -> Option<VulkanDevice> {
+    VulkanDevice::new(&VulkanConfig { validation: flag("PHOX_VALIDATION"), draw_indirect_count: false, ..VulkanConfig::default() }).ok()
+}
+
 fn render(renderer: &mut ForwardRenderer, case: &Case) -> CpuImage {
     let mut sample = make_sample_scene(case.scene).unwrap();
     (sample.animate)(&mut sample.scene, case.time);
@@ -98,6 +102,8 @@ fn render(renderer: &mut ForwardRenderer, case: &Case) -> CpuImage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Path {
     Vertex,
+    /// Vertex shaders on a device without drawIndirectCount.
+    VertexNoCount,
     MeshOcclusion,
     Mesh,
 }
@@ -106,6 +112,7 @@ impl Path {
     fn name(self) -> &'static str {
         match self {
             Path::Vertex => "vertex shaders",
+            Path::VertexNoCount => "vertex shaders, no draw count",
             Path::MeshOcclusion => "mesh shaders, occlusion culling",
             Path::Mesh => "mesh shaders",
         }
@@ -114,7 +121,7 @@ impl Path {
     fn config(self) -> RendererConfig {
         RendererConfig {
             extent: Extent2D::new(320, 240),
-            mesh_shaders: self != Path::Vertex,
+            mesh_shaders: !matches!(self, Path::Vertex | Path::VertexNoCount),
             occlusion_culling: self == Path::MeshOcclusion,
             ..RendererConfig::default()
         }
@@ -125,13 +132,13 @@ impl Path {
 /// match: culling never changes the picture). Only the vertex path rewrites them. Returns the failed cases,
 /// or `None` when the path was skipped.
 fn run_path(vulkan: &VulkanDevice, path: Path) -> Option<Vec<String>> {
-    if path != Path::Vertex && !vulkan.info().mesh_shaders {
+    if matches!(path, Path::MeshOcclusion | Path::Mesh) && !vulkan.info().mesh_shaders {
         assert!(!flag("PHOX_REQUIRE_MESH_SHADERS"), "{} has no mesh shaders", vulkan.info().name);
         eprintln!("{} has no mesh shaders; skipping the mesh shader paths", vulkan.info().name);
         return None;
     }
     let mut renderer = ForwardRenderer::new(Arc::new(vulkan.clone()), path.config()).unwrap();
-    assert_eq!(renderer.uses_mesh_shaders(), path != Path::Vertex);
+    assert_eq!(renderer.uses_mesh_shaders(), matches!(path, Path::MeshOcclusion | Path::Mesh));
     assert_eq!(renderer.uses_occlusion_culling(), path == Path::MeshOcclusion);
 
     let mut failures = Vec::new();
@@ -159,6 +166,7 @@ fn run_path(vulkan: &VulkanDevice, path: Path) -> Option<Vec<String>> {
         if !pass {
             let suffix = match path {
                 Path::Vertex => "vulkan",
+                Path::VertexNoCount => "nocount",
                 Path::MeshOcclusion => "occlusion",
                 Path::Mesh => "mesh",
             };
@@ -179,6 +187,11 @@ fn every_path_matches_the_goldens() {
     let mut failures = Vec::new();
     for path in [Path::Vertex, Path::MeshOcclusion, Path::Mesh] {
         failures.extend(run_path(&vulkan, path).unwrap_or_default());
+    }
+    // PHOX_NO_DRAW_INDIRECT_COUNT=1 tests the path without it; so does asking the device not to use it.
+    if let Some(no_count) = device_without_indirect_count() {
+        failures.extend(run_path(&no_count, Path::VertexNoCount).unwrap_or_default());
+        assert_eq!(no_count.validation_counts(), (0, 0));
     }
     let (errors, warnings) = vulkan.validation_counts();
     assert!(errors == 0 && warnings == 0, "validation reported {errors} error(s) and {warnings} warning(s)");

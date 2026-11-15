@@ -95,12 +95,28 @@ fn the_two_phase_path_draws_what_the_vertex_path_draws() {
 
     // The mesh path is the two-phase one: early, pyramid, late (then tonemap and readback).
     let dot = mesh.frame_graph_dot();
-    for needle in ["forward early", "depth pyramid", "forward late", "meshlet visibility", "meshlet work"] {
+    for needle in ["forward early", "depth pyramid", "forward late", "scene history", "meshlet visibility", "early work"] {
         assert!(dot.contains(needle), "missing '{needle}' in:\n{dot}");
     }
     assert!(!vertex.frame_graph_dot().contains("depth pyramid"));
     let timings: Vec<&str> = mesh.gpu_timings().iter().map(|t| t.pass.as_str()).collect();
-    assert_eq!(timings, ["forward early", "depth pyramid", "forward late", "tonemap", "readback"]);
+    // Objects move every frame, so the scene update runs; then the cull passes bracket the two phases.
+    assert_eq!(
+        timings,
+        [
+            "scene update",
+            "clear draw counters",
+            "cull early",
+            "draw args early",
+            "forward early",
+            "depth pyramid",
+            "cull late",
+            "draw args late",
+            "forward late",
+            "tonemap",
+            "readback"
+        ]
+    );
 
     drop((vertex, mesh));
     let (errors, warnings) = vulkan.validation_counts();

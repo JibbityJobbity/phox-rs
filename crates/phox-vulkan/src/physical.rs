@@ -39,7 +39,7 @@ pub fn has_bindless_textures(f: &vk::PhysicalDeviceVulkan12Features) -> bool {
 /// The best device meeting Phox's requirements (Vulkan 1.3 with synchronization2, dynamic rendering,
 /// descriptor indexing, timeline semaphores, buffer device addresses and multi-draw indirect), preferring
 /// discrete over integrated over virtual over CPU. `preferred` is a case-insensitive substring of its name.
-pub fn select(instance: &Instance, preferred: &str, want_mesh_shaders: bool) -> Result<Selected> {
+pub fn select(instance: &Instance, preferred: &str, want_mesh_shaders: bool, want_indirect_count: bool) -> Result<Selected> {
     let devices = unsafe { instance.raw.enumerate_physical_devices() }.map_err(|e| RhiError::Backend(format!("cannot list Vulkan devices: {e}")))?;
     let preferred = preferred.to_lowercase();
     let mut best: Option<(i32, Selected)> = None;
@@ -78,7 +78,7 @@ pub fn select(instance: &Instance, preferred: &str, want_mesh_shaders: bool) -> 
             unsafe { instance.raw.get_physical_device_features2(physical, &mut mesh_query) };
             mesh.task_shader == vk::TRUE && mesh.mesh_shader == vk::TRUE
         };
-        let disabled = std::env::var("PHOX_NO_DRAW_INDIRECT_COUNT").is_ok_and(|v| v == "1");
+        let disabled = !want_indirect_count || std::env::var("PHOX_NO_DRAW_INDIRECT_COUNT").is_ok_and(|v| v == "1");
         let score = match properties.device_type {
             vk::PhysicalDeviceType::DISCRETE_GPU => 1000,
             vk::PhysicalDeviceType::INTEGRATED_GPU => 100,

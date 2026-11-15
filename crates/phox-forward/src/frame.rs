@@ -65,16 +65,14 @@ impl Drop for GrowBuffer {
 pub struct FrameSlot {
     /// The frame's `FrameUniforms`.
     pub uniforms: GrowBuffer,
-    /// One `MaterialData` per drawn item.
-    pub materials: GrowBuffer,
-    /// One `GpuDraw` per drawn item, read by address.
-    pub draws: GrowBuffer,
-    /// The indirect draw commands.
-    pub commands: GrowBuffer,
-    /// Meshlet path: the task shaders' work items, by list and bucket.
-    pub work: GrowBuffer,
-    /// Meshlet path: each list's `DrawCounters`, which are also its indirect dispatch arguments.
-    pub counters: GrowBuffer,
+    /// The frame's `GpuMesh` table.
+    pub mesh_table: GrowBuffer,
+    /// What changed in the scene this frame: `InstanceUpdate`s and `MaterialUpdate`s.
+    pub instance_updates: GrowBuffer,
+    pub material_updates: GrowBuffer,
+    /// Blended objects' `GpuDraw`s and indirect draw commands, farthest first.
+    pub blend_draws: GrowBuffer,
+    pub blend_commands: GrowBuffer,
     pub ticket: Option<SubmitTicket>,
 }
 
@@ -82,11 +80,11 @@ impl FrameSlot {
     pub fn new(device: &Arc<dyn Device>) -> Result<Self> {
         Ok(Self {
             uniforms: GrowBuffer::new(device.clone(), "frame uniforms", BufferUsage::UNIFORM, false)?,
-            materials: GrowBuffer::new(device.clone(), "materials", BufferUsage::STORAGE, false)?,
-            draws: GrowBuffer::new(device.clone(), "draws", BufferUsage::STORAGE, true)?,
-            commands: GrowBuffer::new(device.clone(), "draw commands", BufferUsage::INDIRECT, false)?,
-            work: GrowBuffer::new(device.clone(), "meshlet work", BufferUsage::STORAGE, true)?,
-            counters: GrowBuffer::new(device.clone(), "meshlet counters", BufferUsage::INDIRECT | BufferUsage::STORAGE, true)?,
+            mesh_table: GrowBuffer::new(device.clone(), "mesh table", BufferUsage::STORAGE, true)?,
+            instance_updates: GrowBuffer::new(device.clone(), "instance updates", BufferUsage::STORAGE, true)?,
+            material_updates: GrowBuffer::new(device.clone(), "material updates", BufferUsage::STORAGE, true)?,
+            blend_draws: GrowBuffer::new(device.clone(), "blend draws", BufferUsage::STORAGE, true)?,
+            blend_commands: GrowBuffer::new(device.clone(), "blend commands", BufferUsage::INDIRECT, false)?,
             ticket: None,
         })
     }

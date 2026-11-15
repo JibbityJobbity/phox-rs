@@ -1,19 +1,19 @@
 //! The headless renderer: a scene in, an image out, through the render graph on any [`Device`].
 
-use crate::error::{ForwardError, Result};
+use crate::error::Result;
 use crate::frame::FrameSlot;
 use crate::gpu_types::*;
 use crate::mesh_cache::MeshCache;
 use crate::passes::*;
 use crate::technique::{ForwardTechnique, FrameInputs};
 use crate::texture_cache::TextureCache;
-use crate::visibility::{Visibility, VisibilityStore};
+use crate::gpu_scene::{GpuScene, SceneFrame, StateBuffer};
 use phox_core::cpu_image::CpuImage;
 use phox_core::graph::*;
-use phox_core::render_view::{DrawItem, RenderView, extract_view};
+use phox_core::render_view::{RenderView, extract_camera};
 use phox_core::resources::Extent2D;
 use phox_core::scene::Scene;
-use phox_core::shader_interface::{FrameUniforms, MaterialData, material_data};
+use phox_core::shader_interface::FrameUniforms;
 use phox_rhi::*;
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ pub struct ForwardRenderer {
     frames: Vec<FrameSlot>,
     meshes: MeshCache,
     textures: TextureCache,
-    visibility: VisibilityStore,
+    scene: GpuScene,
     meshlets: bool,
     occlusion: bool,
     meshlet_culling: bool,
@@ -76,6 +76,7 @@ pub struct ForwardRenderer {
     last_frame: CpuImage,
     timings: Vec<PassTiming>,
     dot: String,
+    cpu_milliseconds: f64,
 }
 
 fn byte_len<T>(items: &[T]) -> u64 {
@@ -93,7 +94,7 @@ impl ForwardRenderer {
         Ok(Self {
             graph: RenderGraph::new(device.clone()),
             meshes: MeshCache::new(device.clone(), meshlets)?,
-            visibility: VisibilityStore::new(device.clone()),
+            scene: GpuScene::new(device.clone(), meshlets, occlusion),
             meshlets,
             occlusion,
             meshlet_culling: config.meshlet_culling,
@@ -105,6 +106,7 @@ impl ForwardRenderer {
             last_frame: CpuImage::default(),
             timings: Vec::new(),
             dot: String::new(),
+            cpu_milliseconds: 0.0,
             config,
             device,
         })
@@ -134,6 +136,11 @@ impl ForwardRenderer {
         &self.timings
     }
 
+    /// CPU time the most recent frame took, from the end of the wait for its frame slot to the submit.
+    pub fn cpu_milliseconds(&self) -> f64 {
+        self.cpu_milliseconds
+    }
+
     /// The most recent frame's compiled render graph in Graphviz DOT; empty unless captured.
     pub fn frame_graph_dot(&self) -> &str {
         &self.dot
@@ -161,36 +168,15 @@ impl ForwardRenderer {
             self.device.wait(ticket)?;
         }
 
+        let cpu_start = std::time::Instant::now();
         self.meshes.begin_frame();
-        let view = extract_view(scene, extent, true);
-        let items: Vec<&DrawItem<'_>> = view.draws.iter().chain(view.transparent.iter()).collect();
         self.textures.begin_frame();
-        for item in &items {
-            self.meshes.require(item.mesh);
-        }
-        // Each item's material table entry names its textures by slot in the bindless table.
-        let mut materials: Vec<MaterialData> = Vec::with_capacity(items.len());
-        for item in &items {
-            let mut data = material_data(item.material);
-            let [base, metallic_roughness, normal, occlusion, emissive] = item.material.textures();
-            let mut slot = |t: Option<&phox_core::texture::Texture>, field: &mut u32| -> Result<()> {
-                if let Some(t) = t {
-                    *field = self.textures.require(t)?;
-                }
-                Ok(())
-            };
-            slot(base, &mut data.base_color_texture)?;
-            slot(metallic_roughness, &mut data.metallic_roughness_texture)?;
-            slot(normal, &mut data.normal_texture)?;
-            slot(occlusion, &mut data.occlusion_texture)?;
-            slot(emissive, &mut data.emissive_texture)?;
-            materials.push(data);
-        }
-        self.meshes.flush()?;
-        self.textures.flush()?;
+        let view = extract_camera(scene, extent);
+        // What changed since last frame goes to the GPU; the meshes and textures in use are uploaded.
+        let frame = self.scene.update(scene, &view, &mut self.meshes, &mut self.textures)?;
 
         let readback = self.readback_buffer(extent)?;
-        let inputs = self.upload_frame(slot_index, &view, &items, &materials, extent, readback)?;
+        let inputs = self.upload_frame(slot_index, &view, &frame, extent, readback)?;
 
         self.technique.set_frame(inputs);
         let mut builder = self.graph.begin();
@@ -203,6 +189,7 @@ impl ForwardRenderer {
         }
         let ticket = builder.execute()?;
         drop(builder);
+        self.cpu_milliseconds = cpu_start.elapsed().as_secs_f64() * 1000.0;
         self.frames[slot_index].ticket = Some(ticket);
         self.frame_count += 1;
 
@@ -215,17 +202,9 @@ impl ForwardRenderer {
         Ok(())
     }
 
-    /// Fills frame slot `slot`'s buffers for `view`: the uniforms, one material and one draw per item, and
-    /// the indirect commands (opaque by cull mode, then blended runs in order).
-    fn upload_frame(
-        &mut self,
-        slot: usize,
-        view: &RenderView<'_>,
-        items: &[&DrawItem<'_>],
-        materials: &[MaterialData],
-        extent: Extent2D,
-        readback: BufferHandle,
-    ) -> Result<FrameInputs> {
+    /// Fills frame slot `slot`'s buffers for `view` and `frame`: the uniforms, the mesh table, what changed
+    /// in the scene and the blended draws.
+    fn upload_frame(&mut self, slot: usize, view: &RenderView<'_>, frame: &SceneFrame, extent: Extent2D, readback: BufferHandle) -> Result<FrameInputs> {
         let (w, h) = (extent.width as f32, extent.height as f32);
         let uniforms = FrameUniforms {
             view: view.view,
@@ -237,141 +216,62 @@ impl ForwardRenderer {
             resolution: phox_core::math::Vec4::new(w, h, 1.0 / w, 1.0 / h),
             frustum_planes: view.frustum_planes,
         };
-        // Occlusion culling keeps each opaque object's visible meshlets from frame to frame.
-        let opaque_count = view.draws.len();
-        let visibility: Vec<Visibility> = if self.occlusion {
-            let objects: Vec<(u64, u64, u32)> = items[..opaque_count]
-                .iter()
-                .map(|item| (item.object_id, item.mesh.id(), self.meshes.get(item.mesh).map_or(0, |i| i.meshlet_count)))
-                .collect();
-            self.visibility.assign(&objects)?
-        } else {
-            Vec::new()
-        };
-        let mut draws: Vec<GpuDraw> = Vec::with_capacity(items.len());
-        for (d, item) in items.iter().enumerate() {
-            let info = self.meshes.get(item.mesh).ok_or_else(|| ForwardError::Other("a mesh was not uploaded".into()))?;
-            let camera = (item.model.inverse() * view.camera_position.extend(1.0)).truncate();
-            let mut draw = GpuDraw {
-                model: item.model,
-                camera_position: camera.extend(1.0),
-                vertices: split_address(info.vertex_address),
-                primitives: [0, 0],
-                count: info.index_count,
-                material: d as u32,
-                visibility_offset: 0,
-                flags: 0,
-            };
-            if self.meshlets && d < opaque_count {
-                draw.primitives = split_address(info.meshlet_address);
-                draw.count = info.meshlet_count;
-                draw.flags = if item.cull_back_faces { DRAW_CONE_CULLING } else { 0 };
-                if let Some(v) = visibility.get(d) {
-                    draw.visibility_offset = v.offset;
-                    draw.flags |= if v.valid { DRAW_EARLY } else { 0 };
-                }
-            }
-            draws.push(draw);
-        }
-        let command = |d: usize, item: &DrawItem<'_>| {
-            let info = self.meshes.get(item.mesh).expect("uploaded above");
-            DrawCommand { index_count: info.index_count, instance_count: 1, first_index: info.first_index, vertex_offset: 0, first_instance: d as u32 }
-        };
-        let mut commands: Vec<DrawCommand> = Vec::with_capacity(items.len());
-        let mut opaque = [CommandRange::default(); 2];
-        for (bucket, range) in opaque.iter_mut().enumerate() {
-            range.first = commands.len() as u32;
-            for (d, item) in view.draws.iter().enumerate().filter(|(_, i)| usize::from(i.cull_back_faces) == bucket) {
-                commands.push(command(d, item));
-            }
-            range.count = commands.len() as u32 - range.first;
-        }
-        // Blended items draw back to front, so they cannot be regrouped: runs of one cull mode, in order.
-        let mut blended: Vec<BlendRun> = Vec::new();
-        for (i, item) in view.transparent.iter().enumerate() {
-            let first = commands.len() as u32;
-            commands.push(command(view.draws.len() + i, item));
-            match blended.last_mut() {
-                Some(run) if run.cull_back_faces == item.cull_back_faces => run.range.count += 1,
-                _ => blended.push(BlendRun { cull_back_faces: item.cull_back_faces, range: CommandRange { first, count: 1 } }),
-            }
-        }
+        let buffers = &mut self.frames[slot];
+        buffers.uniforms.ensure(size_of::<FrameUniforms>() as u64)?;
+        buffers.mesh_table.ensure(byte_len(&frame.mesh_table))?;
+        buffers.instance_updates.ensure(byte_len(&frame.instance_updates))?;
+        buffers.material_updates.ensure(byte_len(&frame.material_updates))?;
+        buffers.blend_draws.ensure(byte_len(&frame.blend_draws))?;
+        buffers.blend_commands.ensure(byte_len(&frame.blend_commands))?;
+        buffers.uniforms.write(bytemuck::bytes_of(&uniforms))?;
+        buffers.mesh_table.write(bytemuck::cast_slice(&frame.mesh_table))?;
+        buffers.instance_updates.write(bytemuck::cast_slice(&frame.instance_updates))?;
+        buffers.material_updates.write(bytemuck::cast_slice(&frame.material_updates))?;
+        buffers.blend_draws.write(bytemuck::cast_slice(&frame.blend_draws))?;
+        buffers.blend_commands.write(bytemuck::cast_slice(&frame.blend_commands))?;
 
-        // Meshlet path: a work item is (draw, group of 32 meshlets); one list per phase and cull bucket.
-        let mut lists: [[Vec<[u32; 2]>; 2]; 3] = Default::default();
-        if self.meshlets {
-            let phases: &[Phase] = if self.occlusion { &[Phase::Early, Phase::Late] } else { &[Phase::Plain] };
-            for (d, draw) in draws.iter().enumerate().take(opaque_count) {
-                let bucket = usize::from(view.draws[d].cull_back_faces);
-                for &phase in phases {
-                    if phase == Phase::Early && draw.flags & DRAW_EARLY == 0 {
-                        continue; // nothing of it was visible last frame
-                    }
-                    lists[phase as usize][bucket].extend((0..draw.count.div_ceil(32)).map(|group| [d as u32, group]));
-                }
-            }
-        }
-        let work_capacity = lists.iter().flatten().map(Vec::len).max().unwrap_or(0).max(1) as u32;
-        let mut work = vec![[0u32; 2]; 3 * 2 * work_capacity as usize];
-        let mut counters = [DrawCounters::default(); 3];
-        let max_x = self.device.capabilities().max_task_workgroup_count_x.max(1);
-        for (phase, buckets) in lists.iter().enumerate() {
-            for (bucket, items) in buckets.iter().enumerate() {
-                let start = (phase * 2 + bucket) * work_capacity as usize;
-                work[start..start + items.len()].copy_from_slice(items);
-                let n = items.len() as u32;
-                let x = n.min(max_x);
-                counters[phase].work_count[bucket] = n;
-                // One workgroup per item, in rows of at most max_x (the task shader skips the excess).
-                counters[phase].args[bucket] = [x, if x == 0 { 1 } else { n.div_ceil(x) }, 1, 0];
-            }
-        }
-
-        let frame = &mut self.frames[slot];
-        if self.meshlets {
-            frame.work.ensure(byte_len(&work))?;
-            frame.counters.ensure(byte_len(&counters))?;
-            frame.work.write(bytemuck::cast_slice(&work))?;
-            frame.counters.write(bytemuck::cast_slice(&counters))?;
-        }
-        frame.uniforms.ensure(size_of::<FrameUniforms>() as u64)?;
-        frame.materials.ensure(byte_len(materials))?;
-        frame.draws.ensure(byte_len(&draws))?;
-        frame.commands.ensure(byte_len(&commands))?;
-        frame.uniforms.write(bytemuck::bytes_of(&uniforms))?;
-        frame.materials.write(bytemuck::cast_slice(materials))?;
-        frame.draws.write(bytemuck::cast_slice(&draws))?;
-        frame.commands.write(bytemuck::cast_slice(&commands))?;
-
+        let caps = self.device.capabilities();
+        let state = |b: &Option<StateBuffer>| b.as_ref().map_or((BufferHandle::INVALID, 0), |b| (b.handle, b.address));
+        let (instances, instances_address) = state(&self.scene.instances);
+        let (materials, materials_address) = state(&self.scene.materials);
+        let (history, history_address) = state(&self.scene.history);
+        let (visibility, visibility_address) = state(&self.scene.visibility);
         Ok(FrameInputs {
             forward: ForwardIn {
                 extent,
                 clear_color: view.clear_color.to_array(),
-                uniforms: frame.uniforms.handle(),
-                materials: frame.materials.handle(),
-                draws: frame.draws.handle(),
-                draws_address: frame.draws.address()?,
-                commands: frame.commands.handle(),
+                uniforms: buffers.uniforms.handle(),
+                mesh_table: buffers.mesh_table.handle(),
+                mesh_table_address: buffers.mesh_table.address()?,
+                instance_updates: buffers.instance_updates.handle(),
+                instance_updates_address: buffers.instance_updates.address()?,
+                instance_update_count: frame.instance_updates.len() as u32,
+                material_updates: buffers.material_updates.handle(),
+                material_updates_address: buffers.material_updates.address()?,
+                material_update_count: frame.material_updates.len() as u32,
+                instances,
+                instances_address,
+                materials,
+                materials_address,
+                history,
+                history_address,
+                visibility,
+                visibility_address,
+                instance_count: frame.instance_count,
+                draw_capacity: frame.draw_capacity,
+                work_capacity: frame.work_capacity,
+                draw_count: caps.has(Feature::DrawIndirectCount),
                 index_pool: self.meshes.index_pool(),
-                opaque,
-                blended,
-                meshlets: if self.meshlets {
-                    Some(MeshletIn {
-                        work: frame.work.handle(),
-                        work_address: frame.work.address()?,
-                        counters: frame.counters.handle(),
-                        counters_address: frame.counters.address()?,
-                        visibility: self.visibility.buffer(),
-                        visibility_address: if self.occlusion { self.visibility.address()? } else { 0 },
-                        work_capacity,
-                        flags: if self.meshlet_culling { MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING } else { 0 },
-                        lod_threshold: 1.0,
-                        occlusion: self.occlusion,
-                        counts: std::array::from_fn(|p| counters[p].work_count),
-                    })
-                } else {
-                    None
-                },
+                max_groups_x: caps.max_task_workgroup_count_x.max(1),
+                blend_draws: buffers.blend_draws.handle(),
+                blend_draws_address: buffers.blend_draws.address()?,
+                blend_commands: buffers.blend_commands.handle(),
+                blended: frame.blend_runs.clone(),
+                meshlets: self.meshlets.then_some(MeshletSettings {
+                    flags: if self.meshlet_culling { MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING } else { 0 },
+                    lod_threshold: 1.0,
+                    occlusion: self.occlusion,
+                }),
             },
             mapping: view.tone_mapping,
             target_format: HEADLESS_FORMAT,

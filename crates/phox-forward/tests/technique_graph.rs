@@ -42,14 +42,14 @@ fn records_forward_tonemap_readback() {
     renderer.render(&sample.scene).unwrap();
 
     let labels: Vec<String> = device.last_recording().into_iter().filter_map(|c| c.strip_prefix("beginDebugLabel:").map(str::to_string)).collect();
-    assert_eq!(labels, ["forward", "tonemap", "readback"]);
+    assert_eq!(labels, ["scene update", "clear draw counters", "cull", "forward", "tonemap", "readback"]);
     let recording = device.last_recording();
     assert!(recording.contains(&"drawIndexedIndirect".to_string()));
     assert!(recording.contains(&"copyTextureToBuffer".to_string()));
     assert_eq!(recording.iter().filter(|c| c.as_str() == "draw").count(), 1); // the tonemap triangle
 
     let dot = renderer.frame_graph_dot();
-    for needle in ["forward", "tonemap", "readback", "hdr", "depth", "display"] {
+    for needle in ["scene update", "cull", "forward", "tonemap", "readback", "hdr", "depth", "display"] {
         assert!(dot.contains(needle), "missing '{needle}' in:\n{dot}");
     }
     assert_eq!(renderer.last_frame().width, 64);
@@ -67,7 +67,11 @@ fn the_mesh_path_records_two_phases_around_a_depth_pyramid() {
 
     let recording = device.last_recording();
     let labels: Vec<&str> = recording.iter().filter_map(|c| c.strip_prefix("beginDebugLabel:")).collect();
-    assert_eq!(labels, ["forward early", "depth pyramid", "forward late", "tonemap", "readback"]);
+    // Nothing changed since the first frame, so there is no scene update.
+    assert_eq!(
+        labels,
+        ["clear draw counters", "cull early", "draw args early", "forward early", "depth pyramid", "cull late", "draw args late", "forward late", "tonemap", "readback"]
+    );
     assert!(recording.contains(&"drawMeshTasksIndirect".to_string()));
     assert!(recording.contains(&"dispatch".to_string())); // the pyramid's mips
     assert!(!recording.contains(&"drawIndexedIndirect".to_string())); // nothing opaque on the vertex path
@@ -82,7 +86,7 @@ fn without_occlusion_culling_one_mesh_pass_draws() {
     assert!(renderer.uses_mesh_shaders() && !renderer.uses_occlusion_culling());
     renderer.render(&make_sample_scene(SampleSceneId::Cubes).unwrap().scene).unwrap();
     let labels: Vec<String> = device.last_recording().into_iter().filter_map(|c| c.strip_prefix("beginDebugLabel:").map(str::to_string)).collect();
-    assert_eq!(labels, ["forward", "tonemap", "readback"]);
+    assert_eq!(labels, ["scene update", "clear draw counters", "cull", "draw args", "forward", "tonemap", "readback"]);
 }
 
 #[test]
@@ -91,7 +95,8 @@ fn an_empty_scene_still_clears_and_tonemaps() {
     device.set_features([Feature::BindlessDescriptors]);
     let mut renderer = ForwardRenderer::new(device.clone(), RendererConfig { extent: Extent2D::new(16, 16), ..RendererConfig::default() }).unwrap();
     renderer.render(&phox_core::scene::Scene::new()).unwrap();
-    assert!(!device.last_recording().contains(&"drawIndexedIndirect".to_string()));
+    // The GPU decides how much to draw, so the indirect draw is recorded even for nothing.
+    assert!(device.last_recording().contains(&"beginDebugLabel:cull".to_string()));
     assert!(device.last_recording().contains(&"beginDebugLabel:tonemap".to_string()));
 }
 

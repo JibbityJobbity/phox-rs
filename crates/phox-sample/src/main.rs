@@ -190,10 +190,6 @@ fn run(args: &Args) -> Result<i32, CliError> {
     if args.flag("window") {
         return Err(CliError::Failed("--window needs the GPU renderer, which is not implemented yet".into()));
     }
-    if args.flag("stats") {
-        log::warn!("--stats needs cluster LOD, which is not implemented yet; ignored");
-    }
-
     let output = if args.has("output") { PathBuf::from(args.value("output")) } else { PathBuf::from(format!("build/rendered_{}.ppm", sample.name)) };
     let frames = frames.max(1);
     let animate = args.flag("animate");
@@ -204,6 +200,7 @@ fn run(args: &Args) -> Result<i32, CliError> {
         validation: args.flag("debug"),
         preferred_device: args.value("device").to_string(),
         mesh_shaders: args.value("mesh-shaders") != "off",
+        draw_indirect_count: true,
     }) {
         Ok(device) => Some(device),
         Err(e) => {
@@ -252,6 +249,7 @@ fn run(args: &Args) -> Result<i32, CliError> {
     const WARMUP_FRAMES: i64 = 3;
     let mut timings = TimingAverages::default();
     let mut graph_written = false;
+    let (mut cpu_ms, mut cpu_frames) = (0.0, 0);
     for i in 0..frames {
         if animate {
             (sample.animate)(&mut sample.scene, time + i as f32 / 60.0);
@@ -268,10 +266,15 @@ fn run(args: &Args) -> Result<i32, CliError> {
         }
         if i >= WARMUP_FRAMES || frames <= WARMUP_FRAMES {
             timings.add(renderer.gpu_timings());
+            cpu_ms += renderer.cpu_milliseconds();
+            cpu_frames += 1;
         }
     }
     if frames > 1 {
         timings.print();
+    }
+    if args.flag("stats") {
+        println!("CPU time per frame: {:.3} ms (recording and submitting)", cpu_ms / f64::from(cpu_frames.max(1)));
     }
     write_ppm(&output, renderer.last_frame())?;
     println!("Wrote {} ({})", output.display(), device.info().name);
