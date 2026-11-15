@@ -1,0 +1,19 @@
+[package]
+name = "phox-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+glam.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tobj.workspace = true
+gltf.workspace = true
+image.workspace = true
+
+[build-dependencies]
+cc.workspace = true

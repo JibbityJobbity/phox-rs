@@ -1,0 +1,4 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// The task shader of the meshlet path; see forward_task.glsl.
+#include "forward_task.glsl"
