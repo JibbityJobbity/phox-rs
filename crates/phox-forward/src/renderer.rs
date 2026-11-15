@@ -6,6 +6,7 @@ use crate::gpu_types::*;
 use crate::mesh_cache::MeshCache;
 use crate::passes::*;
 use crate::technique::{ForwardTechnique, FrameInputs};
+use crate::texture_cache::TextureCache;
 use phox_core::cpu_image::CpuImage;
 use phox_core::graph::*;
 use phox_core::render_view::{DrawItem, RenderView, extract_view};
@@ -48,6 +49,7 @@ pub struct ForwardRenderer {
     technique: ForwardTechnique,
     frames: Vec<FrameSlot>,
     meshes: MeshCache,
+    textures: TextureCache,
     readback: Option<(BufferHandle, Extent2D)>,
     frame_count: u64,
     last_frame: CpuImage,
@@ -67,6 +69,7 @@ impl ForwardRenderer {
         Ok(Self {
             graph: RenderGraph::new(device.clone()),
             meshes: MeshCache::new(device.clone())?,
+            textures: TextureCache::new(device.clone()),
             technique,
             frames,
             readback: None,
@@ -123,13 +126,33 @@ impl ForwardRenderer {
         self.meshes.begin_frame();
         let view = extract_view(scene, extent, true);
         let items: Vec<&DrawItem<'_>> = view.draws.iter().chain(view.transparent.iter()).collect();
+        self.textures.begin_frame();
         for item in &items {
             self.meshes.require(item.mesh);
         }
+        // Each item's material table entry names its textures by slot in the bindless table.
+        let mut materials: Vec<MaterialData> = Vec::with_capacity(items.len());
+        for item in &items {
+            let mut data = material_data(item.material);
+            let [base, metallic_roughness, normal, occlusion, emissive] = item.material.textures();
+            let mut slot = |t: Option<&phox_core::texture::Texture>, field: &mut u32| -> Result<()> {
+                if let Some(t) = t {
+                    *field = self.textures.require(t)?;
+                }
+                Ok(())
+            };
+            slot(base, &mut data.base_color_texture)?;
+            slot(metallic_roughness, &mut data.metallic_roughness_texture)?;
+            slot(normal, &mut data.normal_texture)?;
+            slot(occlusion, &mut data.occlusion_texture)?;
+            slot(emissive, &mut data.emissive_texture)?;
+            materials.push(data);
+        }
         self.meshes.flush()?;
+        self.textures.flush()?;
 
         let readback = self.readback_buffer(extent)?;
-        let inputs = self.upload_frame(slot_index, &view, &items, extent, readback)?;
+        let inputs = self.upload_frame(slot_index, &view, &items, &materials, extent, readback)?;
 
         self.technique.set_frame(inputs);
         let mut builder = self.graph.begin();
@@ -156,7 +179,15 @@ impl ForwardRenderer {
 
     /// Fills frame slot `slot`'s buffers for `view`: the uniforms, one material and one draw per item, and
     /// the indirect commands (opaque by cull mode, then blended runs in order).
-    fn upload_frame(&mut self, slot: usize, view: &RenderView<'_>, items: &[&DrawItem<'_>], extent: Extent2D, readback: BufferHandle) -> Result<FrameInputs> {
+    fn upload_frame(
+        &mut self,
+        slot: usize,
+        view: &RenderView<'_>,
+        items: &[&DrawItem<'_>],
+        materials: &[MaterialData],
+        extent: Extent2D,
+        readback: BufferHandle,
+    ) -> Result<FrameInputs> {
         let (w, h) = (extent.width as f32, extent.height as f32);
         let uniforms = FrameUniforms {
             view: view.view,
@@ -168,11 +199,9 @@ impl ForwardRenderer {
             resolution: phox_core::math::Vec4::new(w, h, 1.0 / w, 1.0 / h),
             frustum_planes: view.frustum_planes,
         };
-        let mut materials: Vec<MaterialData> = Vec::with_capacity(items.len());
         let mut draws: Vec<GpuDraw> = Vec::with_capacity(items.len());
         for (d, item) in items.iter().enumerate() {
             let info = self.meshes.get(item.mesh).ok_or_else(|| ForwardError::Other("a mesh was not uploaded".into()))?;
-            materials.push(material_data(item.material));
             let camera = (item.model.inverse() * view.camera_position.extend(1.0)).truncate();
             draws.push(GpuDraw {
                 model: item.model,
@@ -211,11 +240,11 @@ impl ForwardRenderer {
 
         let frame = &mut self.frames[slot];
         frame.uniforms.ensure(size_of::<FrameUniforms>() as u64)?;
-        frame.materials.ensure(byte_len(&materials))?;
+        frame.materials.ensure(byte_len(materials))?;
         frame.draws.ensure(byte_len(&draws))?;
         frame.commands.ensure(byte_len(&commands))?;
         frame.uniforms.write(bytemuck::bytes_of(&uniforms))?;
-        frame.materials.write(bytemuck::cast_slice(&materials))?;
+        frame.materials.write(bytemuck::cast_slice(materials))?;
         frame.draws.write(bytemuck::cast_slice(&draws))?;
         frame.commands.write(bytemuck::cast_slice(&commands))?;
 

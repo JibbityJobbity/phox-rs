@@ -22,6 +22,7 @@ use std::sync::Arc;
 /// differently, so allow a small per-channel delta everywhere and larger ones on a few pixels.
 const CHANNEL_TOLERANCE: u32 = 2;
 const MAX_FRACTION_OVER_TOLERANCE: f64 = 0.005;
+const TEXTURED_FRACTION_OVER_TOLERANCE: f64 = 0.02;
 /// Each case renders a few frames so the frames in flight and pooled images are reused (and checked by
 /// validation) before the last frame is compared.
 const FRAMES_PER_CASE: usize = 3;
@@ -37,12 +38,16 @@ struct Case {
 fn cases() -> Vec<Case> {
     let plain = ToneMapping::default();
     let case = |name, scene, time, tone_mapping| Case { name, scene, time, tone_mapping, allowed_fraction: MAX_FRACTION_OVER_TOLERANCE };
+    // Textured surfaces differ more across implementations: they pick mips (and filter between them) differently.
+    let textured = |name, scene, time, tone_mapping| Case { allowed_fraction: TEXTURED_FRACTION_OVER_TOLERANCE, ..case(name, scene, time, tone_mapping) };
     vec![
         case("triangle", SampleSceneId::Triangle, 0.0, plain),
         case("triangle_turned", SampleSceneId::Triangle, 2.0, plain), // past 90 degrees: the back face, lit from behind
         case("cubes", SampleSceneId::Cubes, 0.7, plain),
         case("cubes_aces", SampleSceneId::Cubes, 0.7, ToneMapping { op: ToneMapOperator::Aces, exposure: 1.6 }),
         case("tori", SampleSceneId::Tori, 0.8, plain), // meshlets cut by the frustum and facing away
+        // Metal/roughness, textures, normal map, alpha mask and blend, emission.
+        textured("materials", SampleSceneId::Materials, 0.7, plain),
     ]
 }
 
