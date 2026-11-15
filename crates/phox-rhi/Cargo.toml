@@ -1,0 +1,8 @@
+[package]
+name = "phox-rhi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

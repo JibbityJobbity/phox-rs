@@ -6,6 +6,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+phox-rhi = { path = "../phox-rhi" }
 glam.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
@@ -17,3 +18,6 @@ image.workspace = true
 
 [build-dependencies]
 cc.workspace = true
+
+[dev-dependencies]
+phox-null = { path = "../phox-null" }

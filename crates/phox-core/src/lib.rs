@@ -6,6 +6,7 @@ pub mod color;
 pub mod cpu_image;
 pub mod error;
 pub mod gltf_loader;
+pub mod graph;
 pub mod log_setup;
 pub mod math;
 pub mod mesh_loader;

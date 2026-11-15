@@ -424,8 +424,31 @@ dependencies = [
  "gltf",
  "image",
  "log",
+ "phox-null",
+ "phox-rhi",
  "thiserror",
  "tobj",
+]
+
+[[package]]
+name = "phox-metal"
+version = "0.1.0"
+dependencies = [
+ "phox-rhi",
+]
+
+[[package]]
+name = "phox-null"
+version = "0.1.0"
+dependencies = [
+ "phox-rhi",
+]
+
+[[package]]
+name = "phox-rhi"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]

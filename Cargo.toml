@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/phox-core", "crates/phox-sample"]
+members = ["crates/phox-rhi", "crates/phox-null", "crates/phox-metal", "crates/phox-core", "crates/phox-sample"]
 
 [workspace.package]
 edition = "2024"

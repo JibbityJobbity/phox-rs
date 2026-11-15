@@ -4,31 +4,7 @@ use crate::math::{Vec2, Vec3, Vec4};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub enum TextureFilter {
-    Nearest,
-    #[default]
-    Linear,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub enum TextureWrap {
-    #[default]
-    Repeat,
-    MirroredRepeat,
-    ClampToEdge,
-}
-
-/// How a texture is sampled (glTF's sampler). Backends cache one sampler object per distinct description.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub struct SamplerDesc {
-    pub mag_filter: TextureFilter,
-    pub min_filter: TextureFilter,
-    /// Between mips; Nearest picks the closest mip. Only matters for textures with more than one mip.
-    pub mip_filter: TextureFilter,
-    pub wrap_u: TextureWrap,
-    pub wrap_v: TextureWrap,
-}
+pub use phox_rhi::{Filter as TextureFilter, SamplerDesc, WrapMode as TextureWrap};
 
 /// What the texels of a texture mean, which decides how they are filtered and averaged into mips.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

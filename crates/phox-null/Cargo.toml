@@ -1,0 +1,8 @@
+[package]
+name = "phox-null"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+phox-rhi = { path = "../phox-rhi" }

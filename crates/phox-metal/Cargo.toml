@@ -1,0 +1,8 @@
+[package]
+name = "phox-metal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+phox-rhi = { path = "../phox-rhi" }
