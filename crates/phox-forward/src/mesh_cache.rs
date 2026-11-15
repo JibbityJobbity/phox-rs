@@ -2,7 +2,7 @@
 //! one index pool every mesh shares, so a single indirect call can draw any of them.
 
 use crate::error::Result;
-use phox_core::meshlets::{build_meshlets, optimize_index_order};
+use phox_core::meshlets::{MeshletMesh, build_meshlet_lod, build_meshlets, optimize_index_order};
 use phox_core::scene::Mesh;
 use phox_rhi::*;
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ struct Entry {
     version: u64,
     vertices: BufferHandle,
     meshlets: BufferHandle,
+    cpu_meshlets: Option<Arc<MeshletMesh>>,
     info: GpuMeshInfo,
     last_used: u64,
 }
@@ -40,6 +41,7 @@ struct Pending {
     indices: Vec<u32>,
     /// The meshlets then their data, as the shaders read them, and how many meshlets there are.
     meshlets: Option<(Vec<u8>, u32)>,
+    cpu_meshlets: Option<Arc<MeshletMesh>>,
 }
 
 /// Free ranges of the index pool, in indices.
@@ -97,11 +99,15 @@ pub struct MeshCache {
     ranges: RangeAllocator,
     frame: u64,
     meshlets: bool,
+    lod: bool,
+    keep_cpu: bool,
 }
 
 impl MeshCache {
     /// With `meshlets`, every mesh also gets a meshlet buffer for the task and mesh shaders.
-    pub fn new(device: Arc<dyn Device>, meshlets: bool) -> Result<Self> {
+    /// With `lod`, meshlets form a cluster LOD hierarchy (`build_meshlet_lod`); `keep_cpu` also keeps the
+    /// meshlets in host memory, for statistics.
+    pub fn new(device: Arc<dyn Device>, meshlets: bool, lod: bool, keep_cpu: bool) -> Result<Self> {
         let mut cache = Self {
             device,
             entries: HashMap::new(),
@@ -112,6 +118,8 @@ impl MeshCache {
             ranges: RangeAllocator::default(),
             frame: 0,
             meshlets,
+            lod,
+            keep_cpu,
         };
         cache.pool = cache.create_pool(INITIAL_POOL_INDICES)?;
         cache.pool_capacity = INITIAL_POOL_INDICES;
@@ -162,8 +170,12 @@ impl MeshCache {
         }
         // The vertex path draws indices in vertex-cache order, and the meshlets are built from that order.
         let indices = optimize_index_order(mesh);
+        let mut cpu_meshlets = None;
         let meshlets = self.meshlets.then(|| {
-            let mut built = build_meshlets(mesh, &indices);
+            let mut built = if self.lod { build_meshlet_lod(mesh, &indices) } else { build_meshlets(mesh, &indices) };
+            if self.keep_cpu {
+                cpu_meshlets = Some(Arc::new(built.clone()));
+            }
             // Offsets count from the start of the buffer, which holds the meshlets first.
             let shift = (built.meshlets.len() * (size_of::<phox_core::meshlets::Meshlet>() / 4)) as u32;
             for m in &mut built.meshlets {
@@ -174,7 +186,12 @@ impl MeshCache {
             bytes.extend_from_slice(bytemuck::cast_slice(&built.data));
             (bytes, built.meshlets.len() as u32)
         });
-        self.pending.push(Pending { mesh_id: mesh.id(), version: mesh.version(), vertex_bytes: bytemuck::cast_slice(mesh.vertices()).to_vec(), indices, meshlets });
+        self.pending.push(Pending { mesh_id: mesh.id(), version: mesh.version(), vertex_bytes: bytemuck::cast_slice(mesh.vertices()).to_vec(), indices, meshlets, cpu_meshlets });
+    }
+
+    /// The mesh's meshlets in host memory (only with `keep_cpu`).
+    pub fn cpu_meshlets(&self, mesh: &Mesh) -> Option<Arc<MeshletMesh>> {
+        self.entries.get(&mesh.id()).and_then(|e| e.cpu_meshlets.clone())
     }
 
     pub fn get(&self, mesh: &Mesh) -> Option<GpuMeshInfo> {
@@ -243,6 +260,7 @@ impl MeshCache {
                     version: p.version,
                     vertices,
                     meshlets,
+                    cpu_meshlets: p.cpu_meshlets.clone(),
                     info: GpuMeshInfo {
                         vertex_address: self.device.buffer_address(vertices)?,
                         first_index: first as u32,

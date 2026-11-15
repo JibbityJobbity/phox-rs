@@ -2,8 +2,7 @@
 //!
 //! Headless rendering goes through the forward technique on Vulkan (vertex shaders, or task and mesh shaders with
 //! meshlet and occlusion culling), and falls back to the software rasterizer when there is no usable device.
-//! Windowed mode and cluster LOD arrive with later phases: their options are parsed (so the interface is
-//! final) and reported as ignored until then.
+//! Windowed mode arrives with phase 8: `--window` is parsed and refused until then.
 
 use phox_core::cpu_image::write_ppm;
 use phox_core::mesh_loader::load_mesh;
@@ -180,7 +179,7 @@ fn run(args: &Args) -> Result<i32, CliError> {
     if !matches!(args.value("lod"), "on" | "off") {
         return Err(CliError::Usage("--lod expects on or off".into()));
     }
-    let _lod_error: f32 = args.number("lod-error")?;
+    let lod_error: f32 = args.number("lod-error")?;
     let frames: i64 = args.number("frames")?;
     let time: f32 = args.number("time")?;
 
@@ -230,6 +229,9 @@ fn run(args: &Args) -> Result<i32, CliError> {
         mesh_shaders: mode != "off",
         meshlet_culling: mode != "nocull",
         occlusion_culling: mode == "on",
+        mesh_lod: args.value("lod") == "on",
+        lod_error_pixels: lod_error,
+        collect_statistics: args.flag("stats"),
     };
     let mut renderer = ForwardRenderer::new(Arc::new(device.clone()), config).map_err(|e| CliError::Failed(e.to_string()))?;
     println!(
@@ -245,6 +247,9 @@ fn run(args: &Args) -> Result<i32, CliError> {
             "mesh shaders, no meshlet culling"
         }
     );
+    if renderer.uses_mesh_lod() {
+        println!("Cluster LOD on, error budget {lod_error} pixel(s)");
+    }
     // The first frames upload meshes and create pooled images, so they are left out of the averages.
     const WARMUP_FRAMES: i64 = 3;
     let mut timings = TimingAverages::default();
@@ -274,6 +279,12 @@ fn run(args: &Args) -> Result<i32, CliError> {
         timings.print();
     }
     if args.flag("stats") {
+        let stats = renderer.frame_statistics();
+        let percent = if stats.triangles > 0 { 100.0 * stats.lod_triangles as f64 / stats.triangles as f64 } else { 0.0 };
+        println!(
+            "Drew {} object(s): {} of {} triangles after cluster LOD ({percent:.1}%), before meshlet culling",
+            stats.draws, stats.lod_triangles, stats.triangles
+        );
         println!("CPU time per frame: {:.3} ms (recording and submitting)", cpu_ms / f64::from(cpu_frames.max(1)));
     }
     write_ppm(&output, renderer.last_frame())?;

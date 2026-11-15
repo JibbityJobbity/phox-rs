@@ -71,7 +71,7 @@ fn occlusion_scene() -> Occlusion {
 fn the_two_phase_path_draws_what_the_vertex_path_draws() {
     let Some(vulkan) = device() else { return };
     let extent = Extent2D::new(200, 150);
-    let config = |mesh_shaders| RendererConfig { extent, mesh_shaders, capture_graph: true, ..RendererConfig::default() };
+    let config = |mesh_shaders| RendererConfig { extent, mesh_shaders, capture_graph: true, mesh_lod: false, ..RendererConfig::default() };
     let mut vertex = ForwardRenderer::new(Arc::new(vulkan.clone()), config(false)).unwrap();
     let mut mesh = ForwardRenderer::new(Arc::new(vulkan.clone()), config(true)).unwrap();
     assert!(mesh.uses_mesh_shaders() && mesh.uses_occlusion_culling());
@@ -128,7 +128,7 @@ fn the_two_phase_path_draws_what_the_vertex_path_draws() {
 fn the_visibility_store_survives_a_crowd_arriving() {
     let Some(vulkan) = device() else { return };
     let extent = Extent2D::new(160, 120);
-    let config = |mesh_shaders| RendererConfig { extent, mesh_shaders, ..RendererConfig::default() };
+    let config = |mesh_shaders| RendererConfig { extent, mesh_shaders, mesh_lod: false, ..RendererConfig::default() };
     let mut vertex = ForwardRenderer::new(Arc::new(vulkan.clone()), config(false)).unwrap();
     let mut mesh = ForwardRenderer::new(Arc::new(vulkan.clone()), config(true)).unwrap();
     let Occlusion { mut scene, .. } = occlusion_scene();

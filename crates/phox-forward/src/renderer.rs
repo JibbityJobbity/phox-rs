@@ -10,7 +10,8 @@ use crate::texture_cache::TextureCache;
 use crate::gpu_scene::{GpuScene, SceneFrame, StateBuffer};
 use phox_core::cpu_image::CpuImage;
 use phox_core::graph::*;
-use phox_core::render_view::{RenderView, extract_camera};
+use phox_core::meshlets::lod_selected;
+use phox_core::render_view::{RenderView, extract_camera, outside_frustum};
 use phox_core::resources::Extent2D;
 use phox_core::scene::Scene;
 use phox_core::shader_interface::FrameUniforms;
@@ -37,6 +38,14 @@ pub struct RendererConfig {
     /// With meshlet culling: also cull meshlets hidden behind others, drawing in two phases around a depth
     /// pyramid.
     pub occlusion_culling: bool,
+    /// With mesh shaders: build a cluster LOD hierarchy for each mesh and draw, for each part of a mesh, the
+    /// coarsest meshlets whose error stays within `lod_error_pixels` on screen.
+    pub mesh_lod: bool,
+    /// The geometric error, in pixels, cluster LOD may show. Larger draws fewer triangles.
+    pub lod_error_pixels: f32,
+    /// Fill [`ForwardRenderer::frame_statistics`] every frame. Costs CPU time (the LOD selection is repeated
+    /// on the CPU).
+    pub collect_statistics: bool,
 }
 
 impl Default for RendererConfig {
@@ -48,8 +57,22 @@ impl Default for RendererConfig {
             mesh_shaders: true,
             meshlet_culling: true,
             occlusion_culling: true,
+            mesh_lod: true,
+            lod_error_pixels: 1.0,
+            collect_statistics: false,
         }
     }
+}
+
+/// What a frame drew, before meshlet culling (`RendererConfig::collect_statistics`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameStatistics {
+    /// Objects drawn, after frustum culling.
+    pub draws: u64,
+    /// Triangles in their meshes at full detail.
+    pub triangles: u64,
+    /// Triangles in the meshlets cluster LOD selected for them; equals `triangles` without LOD.
+    pub lod_triangles: u64,
 }
 
 /// GPU time of one render graph pass.
@@ -77,6 +100,7 @@ pub struct ForwardRenderer {
     timings: Vec<PassTiming>,
     dot: String,
     cpu_milliseconds: f64,
+    statistics: FrameStatistics,
 }
 
 fn byte_len<T>(items: &[T]) -> u64 {
@@ -93,7 +117,7 @@ impl ForwardRenderer {
         let frames = (0..FRAMES_IN_FLIGHT).map(|_| FrameSlot::new(&device)).collect::<Result<Vec<_>>>()?;
         Ok(Self {
             graph: RenderGraph::new(device.clone()),
-            meshes: MeshCache::new(device.clone(), meshlets)?,
+            meshes: MeshCache::new(device.clone(), meshlets, meshlets && config.mesh_lod, config.collect_statistics)?,
             scene: GpuScene::new(device.clone(), meshlets, occlusion),
             meshlets,
             occlusion,
@@ -107,6 +131,7 @@ impl ForwardRenderer {
             timings: Vec::new(),
             dot: String::new(),
             cpu_milliseconds: 0.0,
+            statistics: FrameStatistics::default(),
             config,
             device,
         })
@@ -134,6 +159,45 @@ impl ForwardRenderer {
     /// GPU time per pass of the most recent frame; empty without timestamps.
     pub fn gpu_timings(&self) -> &[PassTiming] {
         &self.timings
+    }
+
+    /// The most recent frame's statistics, when `collect_statistics` is set (otherwise zeros).
+    pub fn frame_statistics(&self) -> FrameStatistics {
+        self.statistics
+    }
+
+    /// Cluster LOD is on: meshlets come in levels of detail.
+    pub fn uses_mesh_lod(&self) -> bool {
+        self.meshlets && self.config.mesh_lod
+    }
+
+    /// What `view` draws: the objects in the frustum, their triangles, and the triangles of the meshlets cluster
+    /// LOD picks for them (the task shader's `lod_selected`, repeated on the CPU).
+    fn count_statistics(&self, scene: &Scene, view: &RenderView<'_>) -> FrameStatistics {
+        let pixels_per_unit = view.proj.y_axis.y.abs() * 0.5 * view.extent.height as f32;
+        let mut stats = FrameStatistics::default();
+        for object in scene.objects() {
+            let Some(mesh) = object.mesh().filter(|m| !m.is_empty()) else { continue };
+            let model = object.transform().matrix();
+            if outside_frustum(&(view.view_proj * model), mesh.bounds()) {
+                continue;
+            }
+            stats.draws += 1;
+            stats.triangles += mesh.triangle_count() as u64;
+            match self.meshes.cpu_meshlets(mesh) {
+                Some(meshlets) if self.config.mesh_lod => {
+                    let camera = (model.inverse() * view.camera_position.extend(1.0)).truncate();
+                    stats.lod_triangles += meshlets
+                        .meshlets
+                        .iter()
+                        .filter(|m| lod_selected(m, camera, pixels_per_unit, self.config.lod_error_pixels))
+                        .map(|m| u64::from(m.triangle_count))
+                        .sum::<u64>();
+                }
+                _ => stats.lod_triangles += mesh.triangle_count() as u64,
+            }
+        }
+        stats
     }
 
     /// CPU time the most recent frame took, from the end of the wait for its frame slot to the submit.
@@ -174,6 +238,10 @@ impl ForwardRenderer {
         let view = extract_camera(scene, extent);
         // What changed since last frame goes to the GPU; the meshes and textures in use are uploaded.
         let frame = self.scene.update(scene, &view, &mut self.meshes, &mut self.textures)?;
+
+        if self.config.collect_statistics {
+            self.statistics = self.count_statistics(scene, &view);
+        }
 
         let readback = self.readback_buffer(extent)?;
         let inputs = self.upload_frame(slot_index, &view, &frame, extent, readback)?;
@@ -269,7 +337,7 @@ impl ForwardRenderer {
                 blended: frame.blend_runs.clone(),
                 meshlets: self.meshlets.then_some(MeshletSettings {
                     flags: if self.meshlet_culling { MESHLET_FRUSTUM_CULLING | MESHLET_CONE_CULLING } else { 0 },
-                    lod_threshold: 1.0,
+                    lod_threshold: self.config.lod_error_pixels,
                     occlusion: self.occlusion,
                 }),
             },
