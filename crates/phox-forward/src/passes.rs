@@ -101,6 +101,94 @@ pub struct ForwardIn {
     pub blended: Vec<BlendRun>,
     /// Set when the opaque objects are drawn by task and mesh shaders.
     pub meshlets: Option<MeshletSettings>,
+    /// Opaque triangles made on the GPU this frame (see [`crate::FrameExtension`]), drawn after the scene's
+    /// opaque objects.
+    pub generated: Vec<GeneratedDraw>,
+    /// Geometry task and mesh shaders make as it is drawn, in the same pass as `generated`.
+    pub generated_tasks: Vec<GeneratedTasks>,
+}
+
+/// What a [`crate::FrameExtension`] gives the forward pass to draw.
+#[derive(Clone, Debug, Default)]
+pub struct GeneratedGeometry {
+    pub draws: Vec<GeneratedDraw>,
+    pub tasks: Vec<GeneratedTasks>,
+}
+
+/// Geometry made by an application's own task and mesh shaders while it is drawn, shaded by `forward.frag`
+/// like everything else (needs [`Feature::MeshShader`]). The pipeline comes from [`GeneratedTaskPipeline`].
+///
+/// The shaders include `shaders/common.glsl` with `PHOX_MESHLET_DRAW` defined. They get the frame uniforms
+/// (set 0) and `MeshletDrawPushConstants` with only `draws` set: the address of `draws`, whose first
+/// [`crate::GpuDraw`] is theirs to interpret (its `vertices` and `primitives` can carry the addresses of
+/// whatever they read). The mesh shader writes `forward.mesh`'s outputs: world position, normal, texcoord,
+/// tangent and the material's slot at locations 0 to 4.
+#[derive(Clone, Debug)]
+pub struct GeneratedTasks {
+    pub pipeline: PipelineHandle,
+    pub draws: GraphBuffer,
+    /// Buffers the shaders read through addresses, declared here so they get barriers.
+    pub reads: Vec<GraphBuffer>,
+    /// Task shader workgroups in x, y and z (within the device's `maxTaskWorkGroupCount`).
+    pub groups: [u32; 3],
+}
+
+/// A pipeline for [`GeneratedTasks`]: an application's task and mesh shaders with `forward.frag`.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneratedTaskPipeline {
+    pub pipeline: PipelineHandle,
+    shaders: [ShaderHandle; 3],
+}
+
+impl GeneratedTaskPipeline {
+    /// `task` and `mesh` are SPIR-V. `blend`: blend over what is behind without writing depth (unsorted, as
+    /// [`GeneratedDraw::blend`]).
+    pub fn new(device: &dyn Device, task: &[u32], mesh: &[u32], cull_back_faces: bool, blend: bool, name: &str) -> Result<Self> {
+        let shaders = [
+            device.create_shader(&ShaderDesc::new(ShaderStage::Task, task.to_vec()))?,
+            device.create_shader(&ShaderDesc::new(ShaderStage::Mesh, mesh.to_vec()))?,
+            shader(device, ShaderStage::Fragment, "forward.frag")?,
+        ];
+        let mut desc = meshlet_pipeline_desc(shaders, if cull_back_faces { CullMode::Back } else { CullMode::None }, Phase::Plain, name);
+        desc.depth_write = !blend;
+        desc.blend = blend.then_some(BlendDesc { enabled: true });
+        Ok(Self { pipeline: device.create_graphics_pipeline(&desc)?, shaders })
+    }
+
+    pub fn destroy(self, device: &dyn Device) {
+        device.destroy_pipeline(self.pipeline);
+        for s in self.shaders {
+            device.destroy_shader(s);
+        }
+    }
+}
+
+/// Opaque triangles made on the GPU (by passes a [`crate::FrameExtension`] adds before the forward pass),
+/// drawn by the vertex pipeline the scene's objects use, so they get the same shading and the scene's
+/// materials: `forward.vert` reads `GpuDraw`s and `phox::Vertex`es through their addresses, and
+/// `forward.frag` shades with `materials[GpuDraw::material]`, the material of the scene object in that slot.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneratedDraw {
+    /// [`crate::GpuDraw`]s (only `model`, `vertices` and `material` are read); each command's
+    /// `first_instance` picks one.
+    pub draws: GraphBuffer,
+    /// The buffer the draws' `vertices` addresses point into (`phox::Vertex` layout). Declared here so it
+    /// gets a barrier: the shader reads it through its address.
+    pub vertices: GraphBuffer,
+    /// `u32` indices into each draw's vertices.
+    pub indices: GraphBuffer,
+    /// [`crate::DrawCommand`]s from offset 0, read as indirect arguments so that passes before the forward
+    /// pass can write how much to draw, and a `u32` count of them at `count_offset` (4-byte aligned).
+    pub commands: GraphBuffer,
+    /// Room for this many commands. Where the device has `DrawIndirectCount` only the count at `count_offset`
+    /// are drawn; elsewhere all `max_commands` are, so the unused ones must be zero (an `index_count` of 0).
+    pub max_commands: u32,
+    pub count_offset: u64,
+    /// Cull back faces (a closed surface seen from outside) or draw both.
+    pub cull_back_faces: bool,
+    /// Blend over what is behind (the material's alpha) without writing depth, instead of drawing opaque. The
+    /// triangles are not sorted: use it for one closed surface with back faces culled.
+    pub blend: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -609,6 +697,69 @@ impl Component for ForwardPass {
                 self.add_cull(b, "cull", CullVariant::Vertex, input, scene, list, None)?;
                 self.add_draw(b, "forward", input, scene, list, Phase::Plain, (hdr, depth), true, None)?;
             }
+        }
+
+        if !input.generated.is_empty() || !input.generated_tasks.is_empty() {
+            // Generated triangles join the opaque result: tested against and writing its depth.
+            let generated = input.generated.clone();
+            let tasks = input.generated_tasks.clone();
+            let (opaque, blend) = (self.opaque, self.blend);
+            b.add_pass(
+                "forward generated",
+                {
+                    let generated = generated.clone();
+                    let tasks = tasks.clone();
+                    move |p| {
+                        p.color_target_load(hdr)?;
+                        p.depth_target_with(depth, false, 1.0)?;
+                        p.read_buffer(scene.uniforms, BufferAccess::Uniform)?;
+                        p.read_buffer(scene.materials, BufferAccess::ShaderRead)?;
+                        for g in &generated {
+                            p.read_buffer(g.draws, BufferAccess::ShaderRead)?;
+                            p.read_buffer(g.vertices, BufferAccess::ShaderRead)?;
+                            p.read_buffer(g.indices, BufferAccess::Index)?;
+                            p.read_buffer(g.commands, BufferAccess::Indirect)?;
+                        }
+                        for t in &tasks {
+                            p.read_buffer(t.draws, BufferAccess::ShaderRead)?;
+                            for &buffer in &t.reads {
+                                p.read_buffer(buffer, BufferAccess::ShaderRead)?;
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+                move |c| {
+                    for g in &generated {
+                        bind_frame(c, scene.uniforms, scene.materials, if g.blend { blend } else { opaque }[usize::from(g.cull_back_faces)])?;
+                        c.cmd.bind_index_buffer(c.buffer(g.indices)?, 0);
+                        let push = VertexDrawPushConstants { draws: split_address(c.device.buffer_address(c.buffer(g.draws)?)?) };
+                        c.cmd.push_constants(ShaderStages::VERTEX, 0, bytemuck::bytes_of(&push));
+                        if c.device.capabilities().has(Feature::DrawIndirectCount) {
+                            let commands = c.buffer(g.commands)?;
+                            c.cmd.draw_indexed_indirect_count(commands, 0, commands, g.count_offset, g.max_commands, size_of::<DrawCommand>() as u32);
+                        } else {
+                            draw_range(c, g.commands, CommandRange { first: 0, count: g.max_commands })?;
+                        }
+                    }
+                    for t in &tasks {
+                        bind_frame(c, scene.uniforms, scene.materials, t.pipeline)?;
+                        let push = MeshletDrawPushConstants {
+                            draws: split_address(c.device.buffer_address(c.buffer(t.draws)?)?),
+                            work: [0; 2],
+                            counters: [0; 2],
+                            visibility: [0; 2],
+                            bucket: 0,
+                            work_capacity: 0,
+                            flags: 0,
+                            lod_threshold: 0.0,
+                        };
+                        c.cmd.push_constants(ShaderStages::TASK | ShaderStages::MESH, 0, bytemuck::bytes_of(&push));
+                        c.cmd.draw_mesh_tasks(t.groups[0], t.groups[1], t.groups[2]);
+                    }
+                    Ok(())
+                },
+            )?;
         }
 
         if !input.blended.is_empty() {

@@ -109,3 +109,86 @@ fn every_shader_is_embedded() {
         assert_eq!(spirv[0], 0x0723_0203, "{needed} is not SPIR-V"); // the magic number
     }
 }
+
+/// Hands the forward pass one generated draw from buffers made up front.
+struct Generated {
+    draws: BufferHandle,
+    vertices: BufferHandle,
+    indices: BufferHandle,
+    commands: BufferHandle,
+}
+
+impl FrameExtension for Generated {
+    fn build(&mut self, b: &mut GraphBuilder<'_>) -> GraphResult<GeneratedGeometry> {
+        let mut import = |h| b.import_buffer(h, ResourceState::Undefined, ResourceState::Undefined);
+        let draw = GeneratedDraw {
+            draws: import(self.draws)?,
+            vertices: import(self.vertices)?,
+            indices: import(self.indices)?,
+            commands: import(self.commands)?,
+            max_commands: 1,
+            count_offset: 20,
+            cull_back_faces: false,
+            blend: false,
+        };
+        Ok(GeneratedGeometry { draws: vec![draw], tasks: Vec::new() })
+    }
+}
+
+/// Hands the forward pass geometry that task and mesh shaders make.
+struct Tasks {
+    pipeline: GeneratedTaskPipeline,
+    draws: BufferHandle,
+    field: BufferHandle,
+}
+
+impl FrameExtension for Tasks {
+    fn build(&mut self, b: &mut GraphBuilder<'_>) -> GraphResult<GeneratedGeometry> {
+        let mut import = |h| b.import_buffer(h, ResourceState::Undefined, ResourceState::Undefined);
+        let tasks = GeneratedTasks { pipeline: self.pipeline.pipeline, draws: import(self.draws)?, reads: vec![import(self.field)?], groups: [3, 2, 1] };
+        Ok(GeneratedGeometry { draws: Vec::new(), tasks: vec![tasks] })
+    }
+}
+
+#[test]
+fn generated_tasks_are_drawn_by_their_own_pipeline_after_the_opaque_objects() {
+    let device = Arc::new(NullDevice::new());
+    device.set_features([Feature::BindlessDescriptors, Feature::MeshShader]);
+    let config = RendererConfig { extent: Extent2D::new(64, 48), timestamps: false, mesh_shaders: true, occlusion_culling: false, ..RendererConfig::default() };
+    let mut renderer = ForwardRenderer::new(device.clone(), config).unwrap();
+    let buffer = |name: &str| device.create_buffer(&BufferDesc { size: 256, usage: BufferUsage::STORAGE, memory: MemoryKind::GpuOnly, debug_name: name.into(), device_address: true }).unwrap();
+    // Any SPIR-V will do for the null device: Phox's own task and mesh shaders.
+    let (task, mesh) = (phox_forward::shaders::spirv("forward.task").unwrap(), phox_forward::shaders::spirv("forward.mesh").unwrap());
+    let pipeline = GeneratedTaskPipeline::new(device.as_ref(), &task, &mesh, true, true, "tasks").unwrap();
+    let mut tasks = Tasks { pipeline, draws: buffer("draws"), field: buffer("field") };
+    renderer.render_with(&make_sample_scene(SampleSceneId::Cubes).unwrap().scene, &mut tasks).unwrap();
+
+    let recording = device.last_recording();
+    let start = recording.iter().position(|c| c == "beginDebugLabel:forward generated").expect("a 'forward generated' pass");
+    let pass = &recording[start..];
+    let end = pass.iter().position(|c| c.starts_with("endDebugLabel")).unwrap_or(pass.len());
+    assert!(pass[..end].iter().any(|c| c.starts_with("drawMeshTasks")), "{:?}", &pass[..end]);
+    pipeline.destroy(device.as_ref());
+}
+
+#[test]
+fn generated_draws_follow_the_opaque_objects() {
+    for mesh_shaders in [false, true] {
+        let device = Arc::new(NullDevice::new());
+        device.set_features([Feature::BindlessDescriptors, Feature::MeshShader]);
+        let config = RendererConfig { extent: Extent2D::new(64, 48), timestamps: false, mesh_shaders, occlusion_culling: false, ..RendererConfig::default() };
+        let mut renderer = ForwardRenderer::new(device.clone(), config).unwrap();
+        let buffer = |name: &str| device.create_buffer(&BufferDesc { size: 256, usage: BufferUsage::STORAGE, memory: MemoryKind::GpuOnly, debug_name: name.into(), device_address: true }).unwrap();
+        let mut generated = Generated { draws: buffer("draws"), vertices: buffer("vertices"), indices: buffer("indices"), commands: buffer("commands") };
+        renderer.render_with(&make_sample_scene(SampleSceneId::Cubes).unwrap().scene, &mut generated).unwrap();
+
+        let recording = device.last_recording();
+        let labels: Vec<&str> = recording.iter().filter_map(|c| c.strip_prefix("beginDebugLabel:")).collect();
+        let at = |label: &str| labels.iter().position(|l| *l == label).unwrap_or_else(|| panic!("no '{label}' in {labels:?}"));
+        assert_eq!(at("forward generated"), at("forward") + 1, "{labels:?}");
+        assert!(at("forward generated") < at("tonemap"));
+        // The generated triangles go through the vertex pipeline, whichever path the scene's objects take.
+        let generated_pass = &recording[recording.iter().position(|c| c == "beginDebugLabel:forward generated").unwrap()..];
+        assert!(generated_pass.contains(&"drawIndexedIndirect".to_string()));
+    }
+}

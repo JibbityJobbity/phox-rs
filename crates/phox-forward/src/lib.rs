@@ -14,9 +14,9 @@ mod technique;
 mod texture_cache;
 
 pub use error::{ForwardError, Result};
-pub use gpu_types::{DrawCommand, GpuDraw, VertexDrawPushConstants};
+pub use gpu_types::{DrawCommand, GpuDraw, VertexDrawPushConstants, split_address};
 pub use mesh_cache::{GpuMeshInfo, MeshCache};
-pub use passes::{DEPTH_FORMAT, ForwardOptions, ForwardPass, HDR_FORMAT, HEADLESS_FORMAT, ReadbackPass, TonemapPass};
+pub use passes::{DEPTH_FORMAT, ForwardOptions, ForwardPass, GeneratedDraw, GeneratedGeometry, GeneratedTaskPipeline, GeneratedTasks, HDR_FORMAT, HEADLESS_FORMAT, ReadbackPass, TonemapPass};
 pub use renderer::{ForwardRenderer, FrameStatistics, PassTiming, RendererConfig};
 pub use texture_cache::TextureCache;
-pub use technique::{ForwardTechnique, FrameInputs};
+pub use technique::{ForwardTechnique, FrameExtension, FrameInputs};

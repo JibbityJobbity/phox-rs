@@ -5,7 +5,7 @@ use crate::frame::FrameSlot;
 use crate::gpu_types::*;
 use crate::mesh_cache::MeshCache;
 use crate::passes::*;
-use crate::technique::{ForwardTechnique, FrameInputs};
+use crate::technique::{ForwardTechnique, FrameExtension, FrameInputs};
 use crate::texture_cache::TextureCache;
 use crate::gpu_scene::{GpuScene, SceneFrame, StateBuffer};
 use phox_core::cpu_image::CpuImage;
@@ -237,9 +237,18 @@ impl ForwardRenderer {
 
     /// Renders `scene` at the configured size and reads the image back: [`ForwardRenderer::last_frame`].
     pub fn render(&mut self, scene: &Scene) -> Result<()> {
+        self.render_frame_headless(scene, None)
+    }
+
+    /// As [`ForwardRenderer::render`], with `extension`'s passes and generated geometry in the frame.
+    pub fn render_with(&mut self, scene: &Scene, extension: &mut dyn FrameExtension) -> Result<()> {
+        self.render_frame_headless(scene, Some(extension))
+    }
+
+    fn render_frame_headless(&mut self, scene: &Scene, extension: Option<&mut dyn FrameExtension>) -> Result<()> {
         let extent = self.config.extent;
         let readback = self.readback_buffer(extent)?;
-        let ticket = self.render_frame(scene, extent, HEADLESS_FORMAT, Target::Readback(readback))?;
+        let ticket = self.render_frame(scene, extent, HEADLESS_FORMAT, Target::Readback(readback), extension)?;
         // Headless: the frame is finished when render() returns.
         self.device.wait(ticket)?;
         let mut rgba = vec![0u8; extent.width as usize * extent.height as usize * 4];
@@ -253,6 +262,15 @@ impl ForwardRenderer {
     /// Returns false when there was nothing to draw into (a minimized window). The device must have been
     /// made for the window. GPU timings are those of a frame or two ago, the latest the GPU has finished.
     pub fn render_window(&mut self, scene: &Scene, width: u32, height: u32) -> Result<bool> {
+        self.render_frame_window(scene, None, width, height)
+    }
+
+    /// As [`ForwardRenderer::render_window`], with `extension`'s passes and generated geometry in the frame.
+    pub fn render_window_with(&mut self, scene: &Scene, extension: &mut dyn FrameExtension, width: u32, height: u32) -> Result<bool> {
+        self.render_frame_window(scene, Some(extension), width, height)
+    }
+
+    fn render_frame_window(&mut self, scene: &Scene, extension: Option<&mut dyn FrameExtension>, width: u32, height: u32) -> Result<bool> {
         // Collect the timings of frames the GPU has finished with, in order.
         while let Some(&ticket) = self.timing_queue.front() {
             if !self.device.is_complete(ticket) {
@@ -265,7 +283,7 @@ impl ForwardRenderer {
         }
         let Some(backbuffer) = self.device.acquire_backbuffer(width, height)? else { return Ok(false) };
         let extent = Extent2D::new(backbuffer.width, backbuffer.height);
-        let ticket = self.render_frame(scene, extent, backbuffer.format, Target::Window(backbuffer))?;
+        let ticket = self.render_frame(scene, extent, backbuffer.format, Target::Window(backbuffer), extension)?;
         if self.timestamps_enabled() {
             self.timing_queue.push_back(ticket);
         }
@@ -277,7 +295,7 @@ impl ForwardRenderer {
     }
 
     /// Records, compiles and submits one frame; returns its ticket.
-    fn render_frame(&mut self, scene: &Scene, extent: Extent2D, format: Format, target: Target) -> Result<SubmitTicket> {
+    fn render_frame(&mut self, scene: &Scene, extent: Extent2D, format: Format, target: Target, extension: Option<&mut dyn FrameExtension>) -> Result<SubmitTicket> {
         let slot_index = (self.frame_count % FRAMES_IN_FLIGHT as u64) as usize;
         // The frame slot's buffers are rewritten, so the frame that last used them must be done.
         if let Some(ticket) = self.frames[slot_index].ticket.take() {
@@ -298,7 +316,7 @@ impl ForwardRenderer {
         self.technique.set_frame(inputs);
         let mut builder = self.graph.begin();
         builder.set_timestamps(self.config.timestamps && self.device.capabilities().has(Feature::Timestamps));
-        self.technique.build(&mut builder)?;
+        self.technique.build_with(&mut builder, extension)?;
         builder.compile()?;
         if self.config.capture_graph {
             self.dot = builder.to_dot()?;
@@ -385,6 +403,8 @@ impl ForwardRenderer {
                     lod_threshold: self.config.lod_error_pixels,
                     occlusion: self.occlusion,
                 }),
+                generated: Vec::new(), // filled by the technique from the frame's extension
+                generated_tasks: Vec::new(),
             },
             mapping: view.tone_mapping,
             target_format: format,
