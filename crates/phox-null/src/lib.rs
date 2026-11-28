@@ -37,6 +37,9 @@ impl CommandList for NullCommandList {
     fn end_rendering(&mut self) {
         self.push("endRendering");
     }
+    fn set_scissor(&mut self, _: u32, _: u32, _: u32, _: u32) {
+        self.push("setScissor");
+    }
     fn bind_pipeline(&mut self, _: PipelineHandle) {
         self.push("bindPipeline");
     }

@@ -94,6 +94,9 @@ pub trait CommandList: Send {
     /// Sets viewport and scissor to `width` x `height`.
     fn begin_rendering(&mut self, info: &RenderingInfo);
     fn end_rendering(&mut self);
+    /// Limits drawing to `width` x `height` pixels at (`x`, `y`) of the render target, clamped to the target,
+    /// until the next call. [`CommandList::begin_rendering`] resets it to the whole target.
+    fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32);
     fn bind_pipeline(&mut self, pipeline: PipelineHandle);
     fn bind_vertex_buffer(&mut self, buffer: BufferHandle, offset: u64);
     /// `u32` indices only.

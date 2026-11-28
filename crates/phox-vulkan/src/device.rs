@@ -37,11 +37,15 @@ pub struct VulkanConfig {
     /// Use `drawIndirectCount` where the device has it (the environment's `PHOX_NO_DRAW_INDIRECT_COUNT=1`
     /// turns it off too). Off tests the path for devices without it, such as MoltenVK.
     pub draw_indirect_count: bool,
+    /// The Vulkan library to load instead of the system's loader, such as a `libMoltenVK.dylib` shipped inside
+    /// an app or plugin bundle (an ICD exporting `vkGetInstanceProcAddr` works without the loader). `None` means
+    /// the `PHOX_VULKAN_LIBRARY` environment variable if set, otherwise the loader found by name.
+    pub library: Option<std::path::PathBuf>,
 }
 
 impl Default for VulkanConfig {
     fn default() -> Self {
-        Self { validation: false, preferred_device: String::new(), mesh_shaders: true, draw_indirect_count: true }
+        Self { validation: false, preferred_device: String::new(), mesh_shaders: true, draw_indirect_count: true, library: None }
     }
 }
 
@@ -355,7 +359,8 @@ impl VulkanDevice {
     }
 
     fn create(config: &VulkanConfig, window: Option<(RawDisplayHandle, RawWindowHandle)>) -> Result<Self> {
-        let instance = Instance::new(config.validation, window)?;
+        let library = config.library.clone().or_else(|| std::env::var_os("PHOX_VULKAN_LIBRARY").map(Into::into));
+        let instance = Instance::new(config.validation, library.as_deref(), window)?;
         let preferred = if config.preferred_device.is_empty() { std::env::var("PHOX_DEVICE").unwrap_or_default() } else { config.preferred_device.clone() };
         let selected = physical::select(&instance, &preferred, config.mesh_shaders, config.draw_indirect_count)?;
 

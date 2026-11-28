@@ -203,6 +203,7 @@ fn run(args: &Args) -> Result<i32, CliError> {
         preferred_device: args.value("device").to_string(),
         mesh_shaders: args.value("mesh-shaders") != "off",
         draw_indirect_count: true,
+        library: None,
     }) {
         Ok(device) => Some(device),
         Err(e) => {
@@ -385,6 +386,7 @@ fn run_window(args: &Args, mut sample: SampleScene, extent: Extent2D) -> Result<
         preferred_device: args.value("device").to_string(),
         mesh_shaders: mode != "off",
         draw_indirect_count: true,
+        library: None,
     };
     let frames: i64 = args.number("frames")?;
     (sample.animate)(&mut sample.scene, 0.0);

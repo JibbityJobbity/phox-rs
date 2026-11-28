@@ -380,6 +380,15 @@ impl CommandList for VulkanCommandList {
         unsafe { self.inner.device.cmd_end_rendering(self.cb) };
     }
 
+    fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) {
+        // Vulkan clips the scissor to the render area itself; it only needs to stay within i32.
+        let max = i32::MAX as u32;
+        let (x, y) = (x.min(max), y.min(max));
+        let extent = vk::Extent2D { width: width.min(max - x), height: height.min(max - y) };
+        let area = vk::Rect2D { offset: vk::Offset2D { x: x as i32, y: y as i32 }, extent };
+        unsafe { self.inner.device.cmd_set_scissor(self.cb, 0, &[area]) };
+    }
+
     fn bind_pipeline(&mut self, pipeline: PipelineHandle) {
         let current = {
             let st = self.inner.lock();

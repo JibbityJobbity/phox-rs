@@ -72,11 +72,16 @@ fn backend(message: impl std::fmt::Display) -> RhiError {
 }
 
 impl Instance {
-    /// Loads the Vulkan library and creates an instance (API 1.3). `validation` enables the Khronos layer with
-    /// synchronization validation, when it is installed.
-    pub fn new(validation: bool, window: Option<(RawDisplayHandle, RawWindowHandle)>) -> Result<Self> {
-        // SAFETY: loading the system's Vulkan loader.
-        let entry = unsafe { ash::Entry::load() }.map_err(|e| backend(format!("Vulkan is unavailable in this environment: {e}")))?;
+    /// Loads the Vulkan library (`library`, or the system's loader) and creates an instance (API 1.3).
+    /// `validation` enables the Khronos layer with synchronization validation, when it is installed.
+    pub fn new(validation: bool, library: Option<&std::path::Path>, window: Option<(RawDisplayHandle, RawWindowHandle)>) -> Result<Self> {
+        // SAFETY: loading a Vulkan library, which runs its initialisers; it is either the system loader or one
+        // the caller chose.
+        let entry = match library {
+            Some(path) => unsafe { ash::Entry::load_from(path) }
+                .map_err(|e| backend(format!("cannot load the Vulkan library {}: {e}", path.display())))?,
+            None => unsafe { ash::Entry::load() }.map_err(|e| backend(format!("Vulkan is unavailable in this environment: {e}")))?,
+        };
         let layers = unsafe { entry.enumerate_instance_layer_properties() }.map_err(backend)?;
         let layer_present = layers.iter().any(|l| l.layer_name_as_c_str().is_ok_and(|n| n == VALIDATION_LAYER));
         if validation && !layer_present {
