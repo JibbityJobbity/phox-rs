@@ -1,0 +1,20 @@
+[package]
+name = "phox-immediate"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+build = "build.rs"
+description = "Immediate-mode 2D drawing (anti-aliased shapes and a stroke font) on the Phox RHI and render graph"
+
+[dependencies]
+phox-core = { path = "../phox-core" }
+phox-rhi = { path = "../phox-rhi" }
+bytemuck.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+phox-vulkan = { path = "../phox-vulkan" }
+serial_test.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+phox-metal = { path = "../phox-metal" }
