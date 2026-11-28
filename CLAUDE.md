@@ -19,6 +19,15 @@ Add `PHOX_REQUIRE_MESH_SHADERS=1` to make the mesh shader paths fail rather than
 private Xvfb (`Xvfb :99 -screen 0 1280x720x24 &`) and set `DISPLAY=:99 WAYLAND_DISPLAY=`; never open windows on
 the real desktop. `PHOX_TEST_WINDOW=1` enables the CLI's window test.
 
+## macOS
+
+The Metal backend (`crates/phox-metal`, see `docs/metal.md`) is what runs GPU tests on a Mac: render tests pick
+Metal there unless `PHOX_BACKEND=vulkan`. Vulkan through MoltenVK does not find a qualifying device. Without the
+flake, build with plain cargo and a toolchain of at least 1.88 (`cargo +1.91.0 ...` where rustup's default is
+older); `glslangValidator` must be on the PATH. Metal's own validation: `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
+Newer clippy versions flag some `collapsible_if` and `manual_is_multiple_of` lints in older crates that the
+flake's toolchain does not.
+
 ## Notes
 
 - Never raise a golden tolerance to make an image pass; regenerate on lavapipe with `PHOX_UPDATE_GOLDEN=1` and look
