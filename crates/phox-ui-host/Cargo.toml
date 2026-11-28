@@ -1,0 +1,20 @@
+[package]
+name = "phox-ui-host"
+description = "Shows a phox-ui app in a native window: a child view in a window someone else owns (an audio plugin's editor in a DAW) or a window of its own, drawn with Metal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+phox-ui = { path = "../phox-ui" }
+phox-immediate = { path = "../phox-immediate" }
+log = { workspace = true }
+
+# The host draws with Metal, so for now it is macOS only; elsewhere the crate is empty.
+[target.'cfg(target_os = "macos")'.dependencies]
+phox-metal = { path = "../phox-metal" }
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "579130ecb4f9f315ae52190af42f0ea46aeaa4a2", features = ["opengl"] }
+keyboard-types = { version = "0.6", default-features = false }
+raw-window-handle = "0.6"
+raw_window_handle_05 = { package = "raw-window-handle", version = "0.5" }
+arboard = { version = "3", default-features = false }

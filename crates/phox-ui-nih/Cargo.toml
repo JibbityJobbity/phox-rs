@@ -1,0 +1,18 @@
+[package]
+name = "phox-ui-nih"
+description = "phox-ui as an nih-plug editor: the plugin window (through phox-ui-host), parameter binding, and parameter-bound controls"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+phox-ui = { path = "../phox-ui" }
+phox-immediate = { path = "../phox-immediate" }
+phox-ui-host = { path = "../phox-ui-host" }
+
+# Like phox-ui-host, macOS only for now (the window draws with Metal); elsewhere the crate is empty.
+[target.'cfg(target_os = "macos")'.dependencies]
+phox-metal = { path = "../phox-metal" }
+# The revision every plugin built on this uses: a plugin must depend on the same one, or there are two nih_plugs.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+png = "0.18"
